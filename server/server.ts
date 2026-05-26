@@ -4,6 +4,7 @@ import { registerProfilingRoutes } from './routes/profiling';
 import { registerMetadataRoutes } from './routes/metadata';
 import { registerApplyRoutes } from './routes/apply';
 import { registerGenieRoutes } from './routes/genie';
+import { registerSessionRoutes } from './routes/sessions';
 
 createApp({
   plugins: [server(), serving()],
@@ -13,5 +14,6 @@ createApp({
     registerMetadataRoutes(appkit);
     registerApplyRoutes(appkit);
     registerGenieRoutes(appkit);
+    registerSessionRoutes(appkit);
   },
 }).catch(console.error);

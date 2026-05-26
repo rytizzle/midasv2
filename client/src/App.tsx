@@ -31,6 +31,9 @@ import {
 import {
   api,
   type GeneratedMetadata,
+  type ProposalChange,
+  type SessionDetail,
+  type SessionSummary,
   type Table,
   type TableProfile,
   type TagMap,
@@ -49,10 +52,13 @@ const DEFAULT_TABLE_TEMPLATE = [
 const DEFAULT_COLUMN_TEMPLATE =
   "1-2 sentences: business definition, then typical values or categories. Example: 'Total hours logged. Common values: 1, 2, 4, 8 hours.'";
 
+type AppView = 'wizard' | 'sessions';
+
 export default function App() {
   const [user, setUser] = useState<{ email: string; name: string } | null>(null);
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [warehouseId, setWarehouseId] = useState<string>('');
+  const [view, setView] = useState<AppView>('wizard');
   const [step, setStep] = useState(0);
   const [selectedTables, setSelectedTables] = useState<Table[]>([]);
   const [context, setContext] = useState({
@@ -86,14 +92,45 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
+  const resetWizard = () => {
+    setStep(0);
+    setSelectedTables([]);
+    setProfiles(null);
+    setMetadata(null);
+  };
+
   return (
     <div className="min-h-screen bg-background">
       <header className="border-b">
-        <div className="max-w-6xl mx-auto px-6 py-4 flex items-center justify-between">
+        <div className="max-w-6xl mx-auto px-6 py-3 flex items-center justify-between gap-4">
           <div>
             <h1 className="text-xl font-semibold">Midas v2</h1>
             <p className="text-xs text-muted-foreground">AI Metadata Generator · AppKit</p>
           </div>
+          <nav className="flex gap-1">
+            <button
+              type="button"
+              onClick={() => setView('wizard')}
+              className={`text-sm px-3 py-1.5 rounded-md transition-colors ${
+                view === 'wizard'
+                  ? 'bg-primary text-primary-foreground'
+                  : 'text-muted-foreground hover:bg-muted'
+              }`}
+            >
+              New submission
+            </button>
+            <button
+              type="button"
+              onClick={() => setView('sessions')}
+              className={`text-sm px-3 py-1.5 rounded-md transition-colors ${
+                view === 'sessions'
+                  ? 'bg-primary text-primary-foreground'
+                  : 'text-muted-foreground hover:bg-muted'
+              }`}
+            >
+              Sessions
+            </button>
+          </nav>
           <div className="flex items-center gap-3">
             <WarehousePicker
               warehouses={warehouses}
@@ -109,10 +146,10 @@ export default function App() {
         </div>
       </header>
 
-      <Stepper step={step} setStep={setStep} />
+      {view === 'wizard' && <Stepper step={step} setStep={setStep} />}
 
       <main className="max-w-6xl mx-auto px-6 py-6">
-        {step === 0 && (
+        {view === 'wizard' && step === 0 && (
           <TablesStep
             warehouseId={warehouseId}
             selected={selectedTables}
@@ -120,7 +157,7 @@ export default function App() {
             onNext={() => setStep(1)}
           />
         )}
-        {step === 1 && (
+        {view === 'wizard' && step === 1 && (
           <ContextStep
             context={context}
             onChange={setContext}
@@ -128,7 +165,7 @@ export default function App() {
             onNext={() => setStep(2)}
           />
         )}
-        {step === 2 && (
+        {view === 'wizard' && step === 2 && (
           <ProfileStep
             tables={selectedTables}
             warehouseId={warehouseId}
@@ -141,20 +178,22 @@ export default function App() {
             onNext={() => setStep(3)}
           />
         )}
-        {step === 3 && (
+        {view === 'wizard' && step === 3 && (
           <ReviewStep
             tables={selectedTables}
             warehouseId={warehouseId}
             metadata={metadata}
             setMetadata={setMetadata}
             onBack={() => setStep(2)}
-            onRestart={() => {
-              setStep(0);
-              setSelectedTables([]);
-              setProfiles(null);
-              setMetadata(null);
+            onRestart={resetWizard}
+            onSubmitted={() => {
+              resetWizard();
+              setView('sessions');
             }}
           />
+        )}
+        {view === 'sessions' && (
+          <SessionsView userEmail={user?.email ?? ''} warehouseId={warehouseId} />
         )}
       </main>
     </div>
@@ -781,6 +820,7 @@ function ReviewStep({
   setMetadata,
   onBack,
   onRestart,
+  onSubmitted,
 }: {
   tables: Table[];
   warehouseId: string;
@@ -788,10 +828,12 @@ function ReviewStep({
   setMetadata: (m: Record<string, GeneratedMetadata>) => void;
   onBack: () => void;
   onRestart: () => void;
+  onSubmitted: () => void;
 }) {
-  const [applying, setApplying] = useState(false);
-  const [applyResult, setApplyResult] = useState<Array<Record<string, unknown>> | null>(null);
-  const [applyError, setApplyError] = useState<string>('');
+  const [submitting, setSubmitting] = useState(false);
+  const [submitComment, setSubmitComment] = useState('');
+  const [submitError, setSubmitError] = useState<string>('');
+  const [submittedSessionId, setSubmittedSessionId] = useState<string | null>(null);
 
   if (!metadata) {
     return (
@@ -818,27 +860,55 @@ function ReviewStep({
     });
   };
 
-  const doApply = async () => {
-    setApplying(true);
-    setApplyError('');
-    setApplyResult(null);
+  const doSubmit = async () => {
+    setSubmitting(true);
+    setSubmitError('');
+    setSubmittedSessionId(null);
     try {
-      const changes: Record<string, { table_type?: string; table_comment?: string; columns?: Record<string, { description: string }> }> = {};
+      const changes: Array<{
+        table_fqn: string;
+        table_type?: string;
+        kind: 'table_comment' | 'column_comment';
+        column_name?: string;
+        current_value?: string | null;
+        proposed_value: string;
+      }> = [];
       for (const t of tables) {
         const m = metadata[t.full_name];
         if (!m || m.error) continue;
-        changes[t.full_name] = {
-          table_type: t.table_type,
-          table_comment: m.table_comment,
-          columns: m.columns,
-        };
+        if (m.table_comment) {
+          changes.push({
+            table_fqn: t.full_name,
+            table_type: t.table_type,
+            kind: 'table_comment',
+            current_value: t.comment ?? null,
+            proposed_value: m.table_comment,
+          });
+        }
+        for (const [colName, val] of Object.entries(m.columns ?? {})) {
+          if (!val?.description) continue;
+          const existingCol = t.columns.find((c) => c.name === colName);
+          changes.push({
+            table_fqn: t.full_name,
+            table_type: t.table_type,
+            kind: 'column_comment',
+            column_name: colName,
+            current_value: existingCol?.comment ?? null,
+            proposed_value: val.description,
+          });
+        }
       }
-      const r = await api.apply(changes, warehouseId);
-      setApplyResult(r);
+      if (changes.length === 0) {
+        setSubmitError('Nothing to submit — every table errored or had empty descriptions.');
+        return;
+      }
+      const r = await api.submitSession(warehouseId, submitComment, changes);
+      setSubmittedSessionId(r.session_id);
+      setTimeout(() => onSubmitted(), 1500);
     } catch (e) {
-      setApplyError(String((e as Error).message ?? e));
+      setSubmitError(String((e as Error).message ?? e));
     } finally {
-      setApplying(false);
+      setSubmitting(false);
     }
   };
 
@@ -933,44 +1003,479 @@ function ReviewStep({
 
       <Card>
         <CardHeader>
-          <CardTitle>Apply to Unity Catalog</CardTitle>
+          <CardTitle>Submit for approval</CardTitle>
           <CardDescription>
-            Writes <code>COMMENT ON TABLE</code> / <code>ALTER COLUMN COMMENT</code> via your warehouse, as your user.
+            Proposed changes are written to Lakebase and queued for review.
+            On approval, an admin runs <code>COMMENT ON TABLE</code> /{' '}
+            <code>ALTER COLUMN COMMENT</code> via your warehouse to apply them.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
-          {applying && <Spinner />}
-          {applyError && (
-            <div className="text-sm text-destructive bg-destructive/10 p-3 rounded-md">{applyError}</div>
+          <div className="space-y-1">
+            <Label className="text-xs">Submission note (optional)</Label>
+            <Textarea
+              value={submitComment}
+              onChange={(e) => setSubmitComment(e.target.value)}
+              rows={2}
+              placeholder="Anything reviewers should know about this batch."
+              className="text-sm"
+            />
+          </div>
+          {submitting && (
+            <div className="flex items-center gap-2 text-sm">
+              <Spinner /> Submitting…
+            </div>
           )}
-          {applyResult && (
-            <div className="text-sm space-y-1 max-h-64 overflow-y-auto border rounded-md p-3">
-              {applyResult.map((row, i) => {
-                const r = row as { table?: string; type?: string; status?: string; column?: string; error?: string };
-                const ok = r.status === 'success' || r.status === 'restored';
-                return (
-                  <div key={i} className={ok ? 'text-green-600' : 'text-destructive'}>
-                    {r.status === 'success' ? '✓' : r.status === 'restored' ? '↩' : '✗'} {r.table} {r.column ? `· ${r.column}` : ''} {r.error ? `· ${r.error}` : ''}
-                  </div>
-                );
-              })}
+          {submitError && (
+            <div className="text-sm text-destructive bg-destructive/10 p-3 rounded-md">
+              {submitError}
+            </div>
+          )}
+          {submittedSessionId && (
+            <div className="text-sm text-green-700 bg-green-500/10 p-3 rounded-md">
+              ✓ Submitted as session <code>{submittedSessionId.slice(0, 8)}</code> — opening
+              Sessions view…
             </div>
           )}
           <div className="flex justify-between">
-            <Button variant="outline" onClick={onBack}>
+            <Button variant="outline" onClick={onBack} disabled={submitting}>
               ← Back
             </Button>
             <div className="flex gap-2">
-              <Button variant="outline" onClick={onRestart}>
+              <Button variant="outline" onClick={onRestart} disabled={submitting}>
                 Start over
               </Button>
-              <Button onClick={doApply} disabled={applying || !warehouseId}>
-                Apply
+              <Button
+                onClick={doSubmit}
+                disabled={submitting || !warehouseId || !!submittedSessionId}
+              >
+                Submit for approval
               </Button>
             </div>
           </div>
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+function statusBadgeVariant(status: string): 'default' | 'secondary' | 'destructive' {
+  if (status === 'approved') return 'default';
+  if (status === 'rejected') return 'destructive';
+  if (status === 'applied_partial') return 'destructive';
+  return 'secondary';
+}
+
+function timeAgo(iso: string | null | undefined): string {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const s = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
+  return `${Math.floor(s / 86400)}d ago`;
+}
+
+function SessionsView({
+  userEmail,
+  warehouseId,
+}: {
+  userEmail: string;
+  warehouseId: string;
+}) {
+  type Scope = 'mine' | 'pending' | 'all';
+  const [scope, setScope] = useState<Scope>('pending');
+  const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
+  const [error, setError] = useState<string>('');
+  const [activeId, setActiveId] = useState<string | null>(null);
+
+  const refresh = async () => {
+    setError('');
+    try {
+      const opts =
+        scope === 'mine'
+          ? { mine: true }
+          : scope === 'pending'
+            ? { status: 'pending' }
+            : {};
+      const list = await api.listSessions(opts);
+      setSessions(list);
+    } catch (e) {
+      setError(String((e as Error).message ?? e));
+      setSessions([]);
+    }
+  };
+
+  useEffect(() => {
+    refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scope]);
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-[360px_1fr] gap-4">
+      <Card className="lg:max-h-[calc(100vh-180px)] overflow-y-auto">
+        <CardHeader>
+          <div className="flex items-center justify-between">
+            <CardTitle className="text-base">Sessions</CardTitle>
+            <Button variant="outline" size="sm" onClick={refresh}>
+              Refresh
+            </Button>
+          </div>
+          <div className="flex gap-1 pt-2">
+            {(['pending', 'mine', 'all'] as Scope[]).map((s) => (
+              <button
+                key={s}
+                type="button"
+                onClick={() => setScope(s)}
+                className={`text-xs px-2.5 py-1 rounded-full transition-colors ${
+                  scope === s
+                    ? 'bg-primary text-primary-foreground'
+                    : 'text-muted-foreground hover:bg-muted'
+                }`}
+              >
+                {s === 'pending' ? 'Pending review' : s === 'mine' ? 'My submissions' : 'All'}
+              </button>
+            ))}
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-1">
+          {error && (
+            <div className="text-xs text-destructive bg-destructive/10 p-2 rounded">{error}</div>
+          )}
+          {sessions == null && <Spinner />}
+          {sessions && sessions.length === 0 && (
+            <p className="text-sm text-muted-foreground">No sessions in this view.</p>
+          )}
+          {sessions?.map((s) => (
+            <button
+              key={s.session_id}
+              type="button"
+              onClick={() => setActiveId(s.session_id)}
+              className={`w-full text-left p-3 rounded-md border transition-colors ${
+                activeId === s.session_id
+                  ? 'bg-muted border-primary'
+                  : 'hover:bg-muted/50 border-transparent'
+              }`}
+            >
+              <div className="flex items-center gap-2 mb-1">
+                <Badge variant={statusBadgeVariant(s.status)} className="text-[10px]">
+                  {s.status}
+                </Badge>
+                <span className="text-xs text-muted-foreground">
+                  {s.change_count} change{s.change_count === 1 ? '' : 's'}
+                </span>
+                <span className="ml-auto text-[10px] text-muted-foreground">
+                  {timeAgo(s.created_at)}
+                </span>
+              </div>
+              <div className="text-xs text-foreground truncate">
+                {s.submit_comment || <span className="italic text-muted-foreground">(no note)</span>}
+              </div>
+              <div className="text-[10px] text-muted-foreground mt-0.5 truncate">
+                {s.submitted_by}
+              </div>
+            </button>
+          ))}
+        </CardContent>
+      </Card>
+
+      <div>
+        {activeId ? (
+          <SessionDetailCard
+            key={activeId}
+            sessionId={activeId}
+            userEmail={userEmail}
+            warehouseId={warehouseId}
+            onChanged={refresh}
+          />
+        ) : (
+          <Card>
+            <CardContent className="pt-6 text-sm text-muted-foreground">
+              Select a session on the left to review changes.
+            </CardContent>
+          </Card>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SessionDetailCard({
+  sessionId,
+  userEmail,
+  warehouseId,
+  onChanged,
+}: {
+  sessionId: string;
+  userEmail: string;
+  warehouseId: string;
+  onChanged: () => void;
+}) {
+  const [detail, setDetail] = useState<SessionDetail | null>(null);
+  const [reviewComment, setReviewComment] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string>('');
+
+  const load = async () => {
+    setError('');
+    try {
+      const d = await api.getSession(sessionId);
+      setDetail(d);
+      setReviewComment(d.review_comment ?? '');
+    } catch (e) {
+      setError(String((e as Error).message ?? e));
+    }
+  };
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionId]);
+
+  if (!detail) {
+    return (
+      <Card>
+        <CardContent className="pt-6 text-sm">
+          {error ? (
+            <span className="text-destructive">{error}</span>
+          ) : (
+            <Spinner />
+          )}
+        </CardContent>
+      </Card>
+    );
+  }
+
+  const isOwn = detail.submitted_by === userEmail;
+  const canApprove = detail.status === 'pending';
+  const canResubmit = detail.status === 'rejected' && isOwn;
+
+  const groupedByTable = new Map<string, ProposalChange[]>();
+  for (const c of detail.changes) {
+    const arr = groupedByTable.get(c.table_fqn) ?? [];
+    arr.push(c);
+    groupedByTable.set(c.table_fqn, arr);
+  }
+
+  const act = async (fn: () => Promise<unknown>) => {
+    setBusy(true);
+    setError('');
+    try {
+      await fn();
+      await load();
+      onChanged();
+    } catch (e) {
+      setError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <CardTitle className="font-mono text-sm">{detail.session_id.slice(0, 8)}</CardTitle>
+            <CardDescription>
+              Submitted by {detail.submitted_by} · {timeAgo(detail.created_at)}
+            </CardDescription>
+          </div>
+          <Badge variant={statusBadgeVariant(detail.status)}>{detail.status}</Badge>
+        </div>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        {detail.submit_comment && (
+          <div className="text-sm bg-muted/50 p-3 rounded-md italic">
+            “{detail.submit_comment}”
+          </div>
+        )}
+
+        {error && (
+          <div className="text-sm text-destructive bg-destructive/10 p-3 rounded-md">{error}</div>
+        )}
+
+        <Accordion type="multiple" defaultValue={Array.from(groupedByTable.keys())} className="space-y-2">
+          {Array.from(groupedByTable.entries()).map(([fqn, changes]) => {
+            const tableComment = changes.find((c) => c.kind === 'table_comment');
+            const columnChanges = changes.filter((c) => c.kind === 'column_comment');
+            const errors = changes.filter((c) => c.apply_status === 'error').length;
+            return (
+              <AccordionItem key={fqn} value={fqn} className="border rounded-md px-4">
+                <AccordionTrigger className="hover:no-underline py-3">
+                  <div className="flex items-center gap-3 flex-1 min-w-0 text-left">
+                    <span className="font-mono text-sm font-semibold truncate">{fqn}</span>
+                    <Badge variant="secondary" className="text-[10px] shrink-0">
+                      {changes.length} change{changes.length === 1 ? '' : 's'}
+                    </Badge>
+                    {errors > 0 && (
+                      <Badge variant="destructive" className="text-[10px] shrink-0">
+                        {errors} error{errors === 1 ? '' : 's'}
+                      </Badge>
+                    )}
+                  </div>
+                </AccordionTrigger>
+                <AccordionContent className="pb-4 space-y-3">
+                  {tableComment && (
+                    <ChangeDiff
+                      label="Table comment"
+                      change={tableComment}
+                      editable={canResubmit}
+                      sessionId={detail.session_id}
+                      onUpdated={load}
+                    />
+                  )}
+                  {columnChanges.map((c) => (
+                    <ChangeDiff
+                      key={c.change_id}
+                      label={`Column · ${c.column_name}`}
+                      change={c}
+                      editable={canResubmit}
+                      sessionId={detail.session_id}
+                      onUpdated={load}
+                    />
+                  ))}
+                </AccordionContent>
+              </AccordionItem>
+            );
+          })}
+        </Accordion>
+
+        {(canApprove || canResubmit) && (
+          <div className="space-y-2">
+            <Label className="text-xs">Review note (optional)</Label>
+            <Textarea
+              value={reviewComment}
+              onChange={(e) => setReviewComment(e.target.value)}
+              rows={2}
+              className="text-sm"
+              disabled={busy}
+            />
+          </div>
+        )}
+
+        {detail.review_comment && !canApprove && !canResubmit && (
+          <div className="text-sm">
+            <Label className="text-xs">Reviewer note</Label>
+            <div className="bg-muted/50 p-3 rounded-md mt-1">
+              “{detail.review_comment}”
+              <div className="text-[10px] text-muted-foreground mt-1">
+                — {detail.reviewed_by} · {timeAgo(detail.reviewed_at)}
+              </div>
+            </div>
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2 pt-2">
+          {canApprove && (
+            <>
+              <Button
+                variant="outline"
+                onClick={() => act(() => api.rejectSession(detail.session_id, reviewComment))}
+                disabled={busy}
+              >
+                Reject
+              </Button>
+              <Button
+                onClick={() =>
+                  act(() => api.approveSession(detail.session_id, warehouseId, reviewComment))
+                }
+                disabled={busy || !warehouseId}
+              >
+                Approve & apply
+              </Button>
+            </>
+          )}
+          {canResubmit && (
+            <Button
+              onClick={() => act(() => api.resubmitSession(detail.session_id))}
+              disabled={busy}
+            >
+              Resubmit
+            </Button>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function ChangeDiff({
+  label,
+  change,
+  editable,
+  sessionId,
+  onUpdated,
+}: {
+  label: string;
+  change: ProposalChange;
+  editable: boolean;
+  sessionId: string;
+  onUpdated: () => void;
+}) {
+  const [val, setVal] = useState(change.proposed_value);
+  const [saving, setSaving] = useState(false);
+  const isDirty = val !== change.proposed_value;
+
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api.updateChange(sessionId, change.change_id, val);
+      onUpdated();
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center gap-2">
+        <Label className="text-xs">{label}</Label>
+        {change.apply_status === 'success' && (
+          <Badge variant="secondary" className="text-[10px] text-green-700">
+            applied
+          </Badge>
+        )}
+        {change.apply_status === 'error' && (
+          <Badge variant="destructive" className="text-[10px]">
+            apply error
+          </Badge>
+        )}
+      </div>
+      {change.current_value && (
+        <details className="text-xs">
+          <summary className="cursor-pointer text-muted-foreground">
+            Current value
+          </summary>
+          <pre className="whitespace-pre-wrap bg-muted/40 p-2 rounded mt-1 text-[11px]">
+            {change.current_value}
+          </pre>
+        </details>
+      )}
+      {editable ? (
+        <>
+          <Textarea
+            value={val}
+            onChange={(e) => setVal(e.target.value)}
+            rows={3}
+            className="text-sm"
+            disabled={saving}
+          />
+          {isDirty && (
+            <Button size="sm" variant="outline" onClick={save} disabled={saving}>
+              {saving ? 'Saving…' : 'Save change'}
+            </Button>
+          )}
+        </>
+      ) : (
+        <div className="text-sm whitespace-pre-wrap bg-background border rounded-md p-2">
+          {change.proposed_value}
+        </div>
+      )}
+      {change.apply_error && (
+        <div className="text-xs text-destructive">{change.apply_error}</div>
+      )}
     </div>
   );
 }

@@ -85,6 +85,50 @@ async function postJSON<T>(path: string, body: unknown): Promise<T> {
 
 export type TagMap = Record<string, Array<{ value: string; count: number }>>;
 
+export type SessionStatus = 'pending' | 'approved' | 'rejected' | 'applied_partial';
+
+export interface SubmitChange {
+  table_fqn: string;
+  table_type?: string;
+  kind: 'table_comment' | 'column_comment';
+  column_name?: string;
+  current_value?: string | null;
+  proposed_value: string;
+}
+
+export interface SessionSummary {
+  session_id: string;
+  submitted_by: string;
+  submit_comment: string | null;
+  status: SessionStatus;
+  reviewed_by: string | null;
+  review_comment: string | null;
+  warehouse_id: string | null;
+  created_at: string;
+  submitted_at: string | null;
+  reviewed_at: string | null;
+  applied_at: string | null;
+  change_count: number;
+}
+
+export interface ProposalChange {
+  change_id: string;
+  session_id: string;
+  table_fqn: string;
+  table_type: string;
+  kind: 'table_comment' | 'column_comment';
+  column_name: string | null;
+  current_value: string | null;
+  proposed_value: string;
+  apply_status: 'success' | 'error' | null;
+  apply_error: string | null;
+  applied_at: string | null;
+}
+
+export interface SessionDetail extends Omit<SessionSummary, 'change_count'> {
+  changes: ProposalChange[];
+}
+
 export const api = {
   getMe: () => getJSON<UserInfo>('/api/catalog/me'),
   getWarehouses: () => getJSON<Warehouse[]>('/api/catalog/warehouses'),
@@ -119,4 +163,42 @@ export const api = {
     changes: Record<string, { table_type?: string; table_comment?: string; columns?: Record<string, { description: string }> }>,
     warehouseId: string,
   ) => postJSON<Array<Record<string, unknown>>>('/api/apply/execute', { changes, warehouse_id: warehouseId }),
+
+  // Sessions / approvals
+  submitSession: (warehouseId: string, submitComment: string, changes: SubmitChange[]) =>
+    postJSON<{ session_id: string; status: SessionStatus }>('/api/sessions', {
+      warehouse_id: warehouseId,
+      submit_comment: submitComment,
+      changes,
+    }),
+  listSessions: (opts: { mine?: boolean; status?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.mine) q.set('mine', '1');
+    if (opts.status) q.set('status', opts.status);
+    const qs = q.toString();
+    return getJSON<SessionSummary[]>(`/api/sessions${qs ? `?${qs}` : ''}`);
+  },
+  getSession: (id: string) => getJSON<SessionDetail>(`/api/sessions/${id}`),
+  approveSession: (id: string, warehouseId: string, reviewComment: string) =>
+    postJSON<SessionDetail>(`/api/sessions/${id}/approve`, {
+      warehouse_id: warehouseId,
+      review_comment: reviewComment,
+    }),
+  rejectSession: (id: string, reviewComment: string) =>
+    postJSON<SessionDetail>(`/api/sessions/${id}/reject`, { review_comment: reviewComment }),
+  resubmitSession: (id: string) => postJSON<SessionDetail>(`/api/sessions/${id}/resubmit`, {}),
+  updateChange: (sessionId: string, changeId: string, proposedValue: string) =>
+    fetch(`/api/sessions/${sessionId}/changes/${changeId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ proposed_value: proposedValue }),
+    }).then((r) => {
+      if (!r.ok) throw new Error(r.statusText);
+      return r.json();
+    }),
+  discardSession: (id: string) =>
+    fetch(`/api/sessions/${id}`, { method: 'DELETE' }).then((r) => {
+      if (!r.ok) throw new Error(r.statusText);
+      return r.json();
+    }),
 };

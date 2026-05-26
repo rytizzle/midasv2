@@ -1,0 +1,33 @@
+bundle:
+  name: midasv2
+
+sync:
+  include:
+    - .deploy/**
+
+resources:
+  apps:
+    app:
+      name: "midasv2"
+      description: "Midas v2 - AI Metadata Generator for Unity Catalog (AppKit rebuild)"
+      source_code_path: ./.deploy
+
+      user_api_scopes:
+        - sql
+        - dashboards.genie
+        - serving.serving-endpoints
+        - catalog.catalogs:read
+        - catalog.schemas:read
+        - catalog.tables:read
+
+      resources:
+        - name: serving-endpoint
+          serving_endpoint:
+            name: databricks-gpt-5-4
+            permission: CAN_QUERY
+
+targets:
+  default:
+    default: true
+    workspace:
+      host: https://fevm-midas.cloud.databricks.com

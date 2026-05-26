@@ -28,7 +28,14 @@ import {
   TabsTrigger,
   Textarea,
 } from '@databricks/appkit-ui/react';
-import { api, type GeneratedMetadata, type Table, type TableProfile, type Warehouse } from './lib/api';
+import {
+  api,
+  type GeneratedMetadata,
+  type Table,
+  type TableProfile,
+  type TagMap,
+  type Warehouse,
+} from './lib/api';
 
 const STEPS = ['Tables', 'Context', 'Profile & Generate', 'Review & Apply'] as const;
 
@@ -216,16 +223,61 @@ function WarehousePicker({
   );
 }
 
-function TablesStep({
-  warehouseId,
+function TableList({
+  tables,
   selected,
-  onChange,
-  onNext,
+  onToggle,
+  showSchema = false,
 }: {
-  warehouseId: string;
+  tables: Table[];
   selected: Table[];
-  onChange: (t: Table[]) => void;
-  onNext: () => void;
+  onToggle: (t: Table) => void;
+  showSchema?: boolean;
+}) {
+  return (
+    <div className="space-y-1 max-h-96 overflow-y-auto border rounded-md">
+      {tables.map((t) => {
+        const checked = selected.some((s) => s.full_name === t.full_name);
+        return (
+          <div
+            key={t.full_name}
+            role="button"
+            tabIndex={0}
+            onClick={() => onToggle(t)}
+            onKeyDown={(e) => {
+              if (e.key === ' ' || e.key === 'Enter') {
+                e.preventDefault();
+                onToggle(t);
+              }
+            }}
+            className="flex items-center gap-3 px-3 py-2 hover:bg-muted/50 cursor-pointer text-sm"
+          >
+            <Checkbox
+              checked={checked}
+              onCheckedChange={() => onToggle(t)}
+              onClick={(e) => e.stopPropagation()}
+            />
+            <span className="font-mono">
+              {showSchema && (t as Table & { schema_name?: string }).schema_name
+                ? `${(t as Table & { schema_name?: string }).schema_name}.${t.name}`
+                : t.name}
+            </span>
+            <span className="text-xs text-muted-foreground ml-auto">
+              {t.table_type} · {t.column_count} cols
+            </span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function BrowseMode({
+  selected,
+  onToggle,
+}: {
+  selected: Table[];
+  onToggle: (t: Table) => void;
 }) {
   const [catalogs, setCatalogs] = useState<string[] | null>(null);
   const [catalog, setCatalog] = useState<string | undefined>(undefined);
@@ -257,6 +309,263 @@ function TablesStep({
       .finally(() => setLoading(false));
   }, [catalog, schema]);
 
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-2">
+          <Label>Catalog</Label>
+          {catalogs == null ? (
+            <Skeleton className="h-9 w-full" />
+          ) : (
+            <Select value={catalog} onValueChange={setCatalog}>
+              <SelectTrigger>
+                <SelectValue placeholder="Choose catalog" />
+              </SelectTrigger>
+              <SelectContent>
+                {catalogs.map((c) => (
+                  <SelectItem key={c} value={c}>
+                    {c}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+        </div>
+        <div className="space-y-2">
+          <Label>Schema</Label>
+          {!catalog ? (
+            <Input disabled placeholder="Pick a catalog first" />
+          ) : schemas == null ? (
+            <Skeleton className="h-9 w-full" />
+          ) : (
+            <Select value={schema} onValueChange={setSchema}>
+              <SelectTrigger>
+                <SelectValue placeholder="Choose schema" />
+              </SelectTrigger>
+              <SelectContent>
+                {schemas.map((s) => (
+                  <SelectItem key={s} value={s}>
+                    {s}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+        </div>
+      </div>
+
+      <Separator />
+
+      {loading && <Spinner />}
+      {tables && tables.length === 0 && (
+        <p className="text-sm text-muted-foreground">
+          No tables found in {catalog}.{schema}
+        </p>
+      )}
+      {tables && tables.length > 0 && (
+        <TableList tables={tables} selected={selected} onToggle={onToggle} />
+      )}
+    </div>
+  );
+}
+
+function TagFilterMode({
+  warehouseId,
+  selected,
+  onToggle,
+}: {
+  warehouseId: string;
+  selected: Table[];
+  onToggle: (t: Table) => void;
+}) {
+  const [catalogs, setCatalogs] = useState<string[] | null>(null);
+  const [catalog, setCatalog] = useState<string | undefined>(undefined);
+  const [tags, setTags] = useState<TagMap | null>(null);
+  const [tagsLoading, setTagsLoading] = useState(false);
+  const [filters, setFilters] = useState<Record<string, string[]>>({});
+  const [results, setResults] = useState<Table[] | null>(null);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [error, setError] = useState<string>('');
+
+  useEffect(() => {
+    api.getCatalogs().then((cs) => setCatalogs(cs.map((c) => c.name))).catch(() => setCatalogs([]));
+  }, []);
+
+  useEffect(() => {
+    if (!catalog || !warehouseId) return;
+    setTags(null);
+    setFilters({});
+    setResults(null);
+    setError('');
+    setTagsLoading(true);
+    api
+      .getTags(catalog, warehouseId)
+      .then(setTags)
+      .catch((e) => {
+        setTags({});
+        setError(String((e as Error).message ?? e));
+      })
+      .finally(() => setTagsLoading(false));
+  }, [catalog, warehouseId]);
+
+  const activeFilterCount = Object.values(filters).reduce((n, vs) => n + vs.length, 0);
+  const activeKeyCount = Object.values(filters).filter((vs) => vs.length > 0).length;
+
+  const toggleValue = (key: string, value: string) => {
+    setFilters((prev) => {
+      const existing = prev[key] ?? [];
+      const next = existing.includes(value)
+        ? existing.filter((v) => v !== value)
+        : [...existing, value];
+      const out = { ...prev, [key]: next };
+      if (next.length === 0) delete out[key];
+      return out;
+    });
+  };
+
+  const runSearch = async () => {
+    if (!catalog || !warehouseId) return;
+    setSearchLoading(true);
+    setError('');
+    try {
+      const r = await api.getTablesByTags(catalog, warehouseId, filters);
+      setResults(r);
+    } catch (e) {
+      setError(String((e as Error).message ?? e));
+      setResults([]);
+    } finally {
+      setSearchLoading(false);
+    }
+  };
+
+  const clearFilters = () => {
+    setFilters({});
+    setResults(null);
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="space-y-2">
+        <Label>Catalog</Label>
+        {catalogs == null ? (
+          <Skeleton className="h-9 w-full" />
+        ) : (
+          <Select value={catalog} onValueChange={setCatalog}>
+            <SelectTrigger className="w-full">
+              <SelectValue placeholder="Choose catalog" />
+            </SelectTrigger>
+            <SelectContent>
+              {catalogs.map((c) => (
+                <SelectItem key={c} value={c}>
+                  {c}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+      </div>
+
+      {catalog && (
+        <>
+          <Separator />
+
+          <div className="flex items-center justify-between">
+            <Label className="text-sm">Governed tags</Label>
+            {activeFilterCount > 0 && (
+              <Button variant="ghost" size="sm" onClick={clearFilters}>
+                Clear filters
+              </Button>
+            )}
+          </div>
+
+          {tagsLoading && <Spinner />}
+          {tags && Object.keys(tags).length === 0 && !tagsLoading && (
+            <p className="text-sm text-muted-foreground">
+              No governed tags found on tables in {catalog}.
+            </p>
+          )}
+          {tags && Object.keys(tags).length > 0 && (
+            <div className="space-y-3">
+              {Object.entries(tags).map(([key, values]) => (
+                <div key={key} className="space-y-1">
+                  <div className="text-xs font-medium text-muted-foreground">{key}</div>
+                  <div className="flex flex-wrap gap-2">
+                    {values.map(({ value, count }) => {
+                      const isActive = (filters[key] ?? []).includes(value);
+                      return (
+                        <button
+                          key={value}
+                          type="button"
+                          onClick={() => toggleValue(key, value)}
+                          className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                            isActive
+                              ? 'bg-primary text-primary-foreground border-primary'
+                              : 'bg-muted text-foreground border-transparent hover:bg-muted/70'
+                          }`}
+                        >
+                          {value}
+                          <span className="ml-1.5 opacity-60">{count}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className="flex items-center justify-between pt-2">
+            <p className="text-xs text-muted-foreground">
+              {activeFilterCount > 0
+                ? `${activeFilterCount} value${activeFilterCount === 1 ? '' : 's'} across ${activeKeyCount} key${activeKeyCount === 1 ? '' : 's'} (AND across keys, OR within a key)`
+                : 'Pick one or more tag values, then search.'}
+            </p>
+            <Button onClick={runSearch} disabled={activeFilterCount === 0 || searchLoading}>
+              {searchLoading ? 'Searching…' : 'Search'}
+            </Button>
+          </div>
+
+          {error && (
+            <div className="text-sm text-destructive bg-destructive/10 p-3 rounded-md">{error}</div>
+          )}
+
+          {results && (
+            <>
+              <Separator />
+              {results.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No tables match these tags.</p>
+              ) : (
+                <>
+                  <p className="text-xs text-muted-foreground">
+                    {results.length} matching table{results.length === 1 ? '' : 's'}
+                  </p>
+                  <TableList
+                    tables={results}
+                    selected={selected}
+                    onToggle={onToggle}
+                    showSchema
+                  />
+                </>
+              )}
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function TablesStep({
+  warehouseId,
+  selected,
+  onChange,
+  onNext,
+}: {
+  warehouseId: string;
+  selected: Table[];
+  onChange: (t: Table[]) => void;
+  onNext: () => void;
+}) {
   const toggle = (t: Table) => {
     if (selected.some((s) => s.full_name === t.full_name)) {
       onChange(selected.filter((s) => s.full_name !== t.full_name));
@@ -269,88 +578,25 @@ function TablesStep({
     <Card>
       <CardHeader>
         <CardTitle>Pick tables to enrich</CardTitle>
-        <CardDescription>Browse Unity Catalog and select tables. Selection persists across steps.</CardDescription>
+        <CardDescription>
+          Browse by catalog/schema or filter by governed tags. Selection persists across modes.
+        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="grid grid-cols-2 gap-4">
-          <div className="space-y-2">
-            <Label>Catalog</Label>
-            {catalogs == null ? (
-              <Skeleton className="h-9 w-full" />
-            ) : (
-              <Select value={catalog} onValueChange={setCatalog}>
-                <SelectTrigger>
-                  <SelectValue placeholder="Choose catalog" />
-                </SelectTrigger>
-                <SelectContent>
-                  {catalogs.map((c) => (
-                    <SelectItem key={c} value={c}>
-                      {c}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-          </div>
-          <div className="space-y-2">
-            <Label>Schema</Label>
-            {!catalog ? (
-              <Input disabled placeholder="Pick a catalog first" />
-            ) : schemas == null ? (
-              <Skeleton className="h-9 w-full" />
-            ) : (
-              <Select value={schema} onValueChange={setSchema}>
-                <SelectTrigger>
-                  <SelectValue placeholder="Choose schema" />
-                </SelectTrigger>
-                <SelectContent>
-                  {schemas.map((s) => (
-                    <SelectItem key={s} value={s}>
-                      {s}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            )}
-          </div>
-        </div>
+        <Tabs defaultValue="browse">
+          <TabsList>
+            <TabsTrigger value="browse">Browse</TabsTrigger>
+            <TabsTrigger value="tags">Tag filter</TabsTrigger>
+          </TabsList>
+          <TabsContent value="browse" className="pt-4">
+            <BrowseMode selected={selected} onToggle={toggle} />
+          </TabsContent>
+          <TabsContent value="tags" className="pt-4">
+            <TagFilterMode warehouseId={warehouseId} selected={selected} onToggle={toggle} />
+          </TabsContent>
+        </Tabs>
 
-        <Separator />
-
-        {loading && <Spinner />}
-        {tables && tables.length === 0 && (
-          <p className="text-sm text-muted-foreground">No tables found in {catalog}.{schema}</p>
-        )}
-        {tables && tables.length > 0 && (
-          <div className="space-y-1 max-h-96 overflow-y-auto border rounded-md">
-            {tables.map((t) => {
-              const checked = selected.some((s) => s.full_name === t.full_name);
-              return (
-                <div
-                  key={t.full_name}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => toggle(t)}
-                  onKeyDown={(e) => {
-                    if (e.key === ' ' || e.key === 'Enter') {
-                      e.preventDefault();
-                      toggle(t);
-                    }
-                  }}
-                  className="flex items-center gap-3 px-3 py-2 hover:bg-muted/50 cursor-pointer text-sm"
-                >
-                  <Checkbox checked={checked} onCheckedChange={() => toggle(t)} onClick={(e) => e.stopPropagation()} />
-                  <span className="font-mono">{t.name}</span>
-                  <span className="text-xs text-muted-foreground ml-auto">
-                    {t.table_type} · {t.column_count} cols
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        <div className="flex items-center justify-between pt-2">
+        <div className="flex items-center justify-between pt-2 border-t">
           <p className="text-sm text-muted-foreground">
             {selected.length} table{selected.length === 1 ? '' : 's'} selected
           </p>

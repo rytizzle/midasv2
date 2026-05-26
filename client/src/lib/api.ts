@@ -83,6 +83,8 @@ async function postJSON<T>(path: string, body: unknown): Promise<T> {
   return (await resp.json()) as T;
 }
 
+export type TagMap = Record<string, Array<{ value: string; count: number }>>;
+
 export const api = {
   getMe: () => getJSON<UserInfo>('/api/catalog/me'),
   getWarehouses: () => getJSON<Warehouse[]>('/api/catalog/warehouses'),
@@ -93,6 +95,16 @@ export const api = {
     getJSON<Table[]>(
       `/api/catalog/tables?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}`,
     ),
+  getTags: (catalog: string, warehouseId: string) =>
+    getJSON<TagMap>(
+      `/api/catalog/tags?catalog=${encodeURIComponent(catalog)}&warehouse_id=${encodeURIComponent(warehouseId)}`,
+    ),
+  getTablesByTags: (catalog: string, warehouseId: string, filters: Record<string, string[]>) =>
+    postJSON<Table[]>('/api/catalog/tables-by-tags', {
+      catalog,
+      warehouse_id: warehouseId,
+      filters,
+    }),
   profile: (tables: string[], warehouseId: string) =>
     postJSON<Record<string, TableProfile>>('/api/profiling/profile', {
       tables,

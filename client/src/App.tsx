@@ -1236,6 +1236,9 @@ function SessionDetailCard({
   const [reviewComment, setReviewComment] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>('');
+  // Selection state for per-change approve/reject. Defaults to all undecided
+  // selected so an admin can "Approve selected" with one click on a fresh session.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
 
   const load = async () => {
     setError('');
@@ -1243,6 +1246,7 @@ function SessionDetailCard({
       const d = await api.getSession(sessionId);
       setDetail(d);
       setReviewComment(d.review_comment ?? '');
+      setSelected(new Set(d.changes.filter((c) => !c.decision).map((c) => c.change_id)));
     } catch (e) {
       setError(String((e as Error).message ?? e));
     }
@@ -1268,8 +1272,23 @@ function SessionDetailCard({
   }
 
   const isOwn = detail.submitted_by === userEmail;
-  const canApprove = detail.status === 'pending' && isAdmin;
+  const canDecide = detail.status === 'pending' && isAdmin;
   const canResubmit = detail.status === 'rejected' && isOwn;
+  const undecidedChanges = detail.changes.filter((c) => !c.decision);
+  const selectedUndecided = undecidedChanges.filter((c) => selected.has(c.change_id));
+  const approvedCount = detail.changes.filter((c) => c.decision === 'approved').length;
+  const rejectedCount = detail.changes.filter((c) => c.decision === 'rejected').length;
+  const errorCount = detail.changes.filter((c) => c.apply_status === 'error').length;
+
+  const toggleSelected = (id: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  const selectAll = () => setSelected(new Set(undecidedChanges.map((c) => c.change_id)));
+  const selectNone = () => setSelected(new Set());
 
   const groupedByTable = new Map<string, ProposalChange[]>();
   for (const c of detail.changes) {
@@ -1316,11 +1335,54 @@ function SessionDetailCard({
           <div className="text-sm text-destructive bg-destructive/10 p-3 rounded-md">{error}</div>
         )}
 
+        {canDecide && (
+          <div className="flex items-center justify-between text-xs text-muted-foreground">
+            <div>
+              <span className="font-medium text-foreground">
+                {selectedUndecided.length}
+              </span>{' '}
+              of {undecidedChanges.length} undecided selected
+              {(approvedCount > 0 || rejectedCount > 0) && (
+                <>
+                  {' · '}
+                  <span className="text-green-700">{approvedCount} approved</span>
+                  {rejectedCount > 0 && (
+                    <>
+                      {' · '}
+                      <span className="text-destructive">{rejectedCount} rejected</span>
+                    </>
+                  )}
+                </>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={selectAll}
+                className="text-primary hover:underline"
+                disabled={busy}
+              >
+                Select all
+              </button>
+              <button
+                type="button"
+                onClick={selectNone}
+                className="text-primary hover:underline"
+                disabled={busy}
+              >
+                None
+              </button>
+            </div>
+          </div>
+        )}
+
         <Accordion type="multiple" defaultValue={Array.from(groupedByTable.keys())} className="space-y-2">
           {Array.from(groupedByTable.entries()).map(([fqn, changes]) => {
             const tableComment = changes.find((c) => c.kind === 'table_comment');
             const columnChanges = changes.filter((c) => c.kind === 'column_comment');
-            const errors = changes.filter((c) => c.apply_status === 'error').length;
+            const tableApproved = changes.filter((c) => c.decision === 'approved').length;
+            const tableRejected = changes.filter((c) => c.decision === 'rejected').length;
+            const tableErrors = changes.filter((c) => c.apply_status === 'error').length;
             return (
               <AccordionItem key={fqn} value={fqn} className="border rounded-md px-4">
                 <AccordionTrigger className="hover:no-underline py-3">
@@ -1329,9 +1391,19 @@ function SessionDetailCard({
                     <Badge variant="secondary" className="text-[10px] shrink-0">
                       {changes.length} change{changes.length === 1 ? '' : 's'}
                     </Badge>
-                    {errors > 0 && (
+                    {tableApproved > 0 && (
+                      <Badge variant="secondary" className="text-[10px] shrink-0 text-green-700">
+                        {tableApproved} approved
+                      </Badge>
+                    )}
+                    {tableRejected > 0 && (
                       <Badge variant="destructive" className="text-[10px] shrink-0">
-                        {errors} error{errors === 1 ? '' : 's'}
+                        {tableRejected} rejected
+                      </Badge>
+                    )}
+                    {tableErrors > 0 && (
+                      <Badge variant="destructive" className="text-[10px] shrink-0">
+                        {tableErrors} error{tableErrors === 1 ? '' : 's'}
                       </Badge>
                     )}
                   </div>
@@ -1341,7 +1413,10 @@ function SessionDetailCard({
                     <ChangeDiff
                       label="Table comment"
                       change={tableComment}
-                      editable={canResubmit}
+                      editable={canResubmit && !tableComment.decision}
+                      selectable={canDecide && !tableComment.decision}
+                      selected={selected.has(tableComment.change_id)}
+                      onToggleSelect={() => toggleSelected(tableComment.change_id)}
                       sessionId={detail.session_id}
                       onUpdated={load}
                     />
@@ -1351,7 +1426,10 @@ function SessionDetailCard({
                       key={c.change_id}
                       label={`Column · ${c.column_name}`}
                       change={c}
-                      editable={canResubmit}
+                      editable={canResubmit && !c.decision}
+                      selectable={canDecide && !c.decision}
+                      selected={selected.has(c.change_id)}
+                      onToggleSelect={() => toggleSelected(c.change_id)}
                       sessionId={detail.session_id}
                       onUpdated={load}
                     />
@@ -1362,7 +1440,7 @@ function SessionDetailCard({
           })}
         </Accordion>
 
-        {(canApprove || canResubmit) && (
+        {(canDecide || canResubmit) && (
           <div className="space-y-2">
             <Label className="text-xs">Review note (optional)</Label>
             <Textarea
@@ -1375,7 +1453,7 @@ function SessionDetailCard({
           </div>
         )}
 
-        {detail.review_comment && !canApprove && !canResubmit && (
+        {detail.review_comment && !canDecide && !canResubmit && (
           <div className="text-sm">
             <Label className="text-xs">Reviewer note</Label>
             <div className="bg-muted/50 p-3 rounded-md mt-1">
@@ -1388,22 +1466,38 @@ function SessionDetailCard({
         )}
 
         <div className="flex justify-end gap-2 pt-2">
-          {canApprove && (
+          {canDecide && (
             <>
               <Button
                 variant="outline"
-                onClick={() => act(() => api.rejectSession(detail.session_id, reviewComment))}
-                disabled={busy}
+                onClick={() =>
+                  act(() =>
+                    api.decideSession(detail.session_id, {
+                      approve_ids: [],
+                      reject_ids: selectedUndecided.map((c) => c.change_id),
+                      warehouse_id: warehouseId,
+                      review_comment: reviewComment,
+                    }),
+                  )
+                }
+                disabled={busy || selectedUndecided.length === 0}
               >
-                Reject
+                Reject selected
               </Button>
               <Button
                 onClick={() =>
-                  act(() => api.approveSession(detail.session_id, warehouseId, reviewComment))
+                  act(() =>
+                    api.decideSession(detail.session_id, {
+                      approve_ids: selectedUndecided.map((c) => c.change_id),
+                      reject_ids: [],
+                      warehouse_id: warehouseId,
+                      review_comment: reviewComment,
+                    }),
+                  )
                 }
-                disabled={busy || !warehouseId}
+                disabled={busy || selectedUndecided.length === 0 || !warehouseId}
               >
-                Approve & apply
+                Approve selected ({selectedUndecided.length})
               </Button>
             </>
           )}
@@ -1416,6 +1510,11 @@ function SessionDetailCard({
             </Button>
           )}
         </div>
+        {errorCount > 0 && detail.status !== 'pending' && (
+          <p className="text-xs text-destructive">
+            {errorCount} change{errorCount === 1 ? '' : 's'} failed to apply — see badges above.
+          </p>
+        )}
       </CardContent>
     </Card>
   );
@@ -1425,12 +1524,18 @@ function ChangeDiff({
   label,
   change,
   editable,
+  selectable = false,
+  selected = false,
+  onToggleSelect,
   sessionId,
   onUpdated,
 }: {
   label: string;
   change: ProposalChange;
   editable: boolean;
+  selectable?: boolean;
+  selected?: boolean;
+  onToggleSelect?: () => void;
   sessionId: string;
   onUpdated: () => void;
 }) {
@@ -1451,7 +1556,24 @@ function ChangeDiff({
   return (
     <div className="space-y-1">
       <div className="flex items-center gap-2">
+        {selectable && onToggleSelect && (
+          <Checkbox
+            checked={selected}
+            onCheckedChange={onToggleSelect}
+            aria-label={`Select ${label}`}
+          />
+        )}
         <Label className="text-xs">{label}</Label>
+        {change.decision === 'approved' && (
+          <Badge variant="secondary" className="text-[10px] text-green-700">
+            approved
+          </Badge>
+        )}
+        {change.decision === 'rejected' && (
+          <Badge variant="destructive" className="text-[10px]">
+            rejected
+          </Badge>
+        )}
         {change.apply_status === 'success' && (
           <Badge variant="secondary" className="text-[10px] text-green-700">
             applied

@@ -158,6 +158,28 @@ async function ensureSchema(): Promise<void> {
     CREATE INDEX IF NOT EXISTS change_proposals_session_idx
       ON midas.change_proposals(session_id);
   `);
+  // v2: per-change decision (approved | rejected | null)
+  await pool.query(`
+    ALTER TABLE midas.change_proposals
+      ADD COLUMN IF NOT EXISTS decision text;
+  `);
+  // Backfill so existing sessions surface meaningfully in the new UI.
+  await pool.query(`
+    UPDATE midas.change_proposals c
+       SET decision = 'approved'
+      FROM midas.sessions s
+     WHERE c.session_id = s.session_id
+       AND c.decision IS NULL
+       AND s.status IN ('approved', 'applied_partial');
+  `);
+  await pool.query(`
+    UPDATE midas.change_proposals c
+       SET decision = 'rejected'
+      FROM midas.sessions s
+     WHERE c.session_id = s.session_id
+       AND c.decision IS NULL
+       AND s.status = 'rejected';
+  `);
 }
 
 export async function getPool(): Promise<pg.Pool> {

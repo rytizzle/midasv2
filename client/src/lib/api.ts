@@ -85,7 +85,12 @@ async function postJSON<T>(path: string, body: unknown): Promise<T> {
 
 export type TagMap = Record<string, Array<{ value: string; count: number }>>;
 
-export type SessionStatus = 'pending' | 'approved' | 'rejected' | 'applied_partial';
+export type SessionStatus =
+  | 'pending'
+  | 'approved'
+  | 'rejected'
+  | 'partial'
+  | 'applied_partial';
 
 export interface SubmitChange {
   table_fqn: string;
@@ -120,6 +125,7 @@ export interface ProposalChange {
   column_name: string | null;
   current_value: string | null;
   proposed_value: string;
+  decision: 'approved' | 'rejected' | null;
   apply_status: 'success' | 'error' | null;
   apply_error: string | null;
   applied_at: string | null;
@@ -186,13 +192,15 @@ export const api = {
     return getJSON<SessionSummary[]>(`/api/sessions${qs ? `?${qs}` : ''}`);
   },
   getSession: (id: string) => getJSON<SessionDetail>(`/api/sessions/${id}`),
-  approveSession: (id: string, warehouseId: string, reviewComment: string) =>
-    postJSON<SessionDetail>(`/api/sessions/${id}/approve`, {
-      warehouse_id: warehouseId,
-      review_comment: reviewComment,
-    }),
-  rejectSession: (id: string, reviewComment: string) =>
-    postJSON<SessionDetail>(`/api/sessions/${id}/reject`, { review_comment: reviewComment }),
+  decideSession: (
+    id: string,
+    args: {
+      approve_ids: string[];
+      reject_ids: string[];
+      warehouse_id: string;
+      review_comment?: string;
+    },
+  ) => postJSON<SessionDetail>(`/api/sessions/${id}/decide`, args),
   resubmitSession: (id: string) => postJSON<SessionDetail>(`/api/sessions/${id}/resubmit`, {}),
   updateChange: (sessionId: string, changeId: string, proposedValue: string) =>
     fetch(`/api/sessions/${sessionId}/changes/${changeId}`, {

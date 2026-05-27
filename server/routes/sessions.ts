@@ -32,6 +32,7 @@ interface ChangeRow {
   column_name: string | null;
   current_value: string | null;
   proposed_value: string;
+  decision: 'approved' | 'rejected' | null;
   apply_status: string | null;
   apply_error: string | null;
   applied_at: Date | null;
@@ -205,35 +206,96 @@ export function registerSessionRoutes(appkit: AppKit) {
       }
     });
 
-    /** Approve a pending session: apply changes to UC, record results. ADMIN ONLY. */
-    app.post('/api/sessions/:id/approve', async (req: Request, res: Response) => {
+    /**
+     * Apply per-change decisions. ADMIN ONLY.
+     * Body:
+     *   approve_ids: change IDs to mark approved AND apply via SQL
+     *   reject_ids:  change IDs to mark rejected
+     *   review_comment: reviewer note (overwrites any prior note)
+     *   warehouse_id: required when approve_ids is non-empty
+     *
+     * Can be called multiple times on the same session; only changes that
+     * are still undecided are processed. Session status is recomputed:
+     *   pending  → at least one undecided change remains
+     *   approved → all decided, all approved, all applied cleanly
+     *   rejected → all decided, all rejected
+     *   partial  → mixed outcomes or any apply errors
+     */
+    app.post('/api/sessions/:id/decide', async (req: Request, res: Response) => {
       const id = String(req.params.id);
       try {
         if (!(await isWorkspaceAdmin(req))) {
-          res.status(403).json({ error: 'workspace admin required to approve' });
+          res.status(403).json({ error: 'workspace admin required' });
           return;
         }
-        const body = req.body as { review_comment?: string; warehouse_id?: string };
+        const body = req.body as {
+          approve_ids?: string[];
+          reject_ids?: string[];
+          review_comment?: string;
+          warehouse_id?: string;
+        };
+        const approveIds = new Set(body.approve_ids ?? []);
+        const rejectIds = new Set(body.reject_ids ?? []);
+        if (approveIds.size === 0 && rejectIds.size === 0) {
+          res.status(400).json({ error: 'no changes selected' });
+          return;
+        }
+        for (const id of approveIds) {
+          if (rejectIds.has(id)) {
+            res.status(400).json({ error: `change ${id} listed for both approve and reject` });
+            return;
+          }
+        }
+
         const session = await getSessionWithChanges(id);
         if (!session) {
           res.status(404).json({ error: 'not found' });
           return;
         }
         if (session.status !== 'pending') {
-          res.status(400).json({ error: `cannot approve from status ${session.status}` });
-          return;
-        }
-        const warehouseId = body.warehouse_id || session.warehouse_id;
-        if (!warehouseId) {
-          res.status(400).json({ error: 'warehouse_id is required' });
+          res.status(400).json({ error: `session is ${session.status}, no further decisions` });
           return;
         }
 
-        const ws = userWorkspaceClient(req);
+        const undecided = new Set(
+          session.changes.filter((c) => !c.decision).map((c) => c.change_id),
+        );
+        const toApprove = session.changes.filter(
+          (c) => approveIds.has(c.change_id) && undecided.has(c.change_id),
+        );
+        const toReject = session.changes.filter(
+          (c) => rejectIds.has(c.change_id) && undecided.has(c.change_id),
+        );
+        if (toApprove.length === 0 && toReject.length === 0) {
+          res.status(400).json({ error: 'all selected changes are already decided' });
+          return;
+        }
+
+        const warehouseId = body.warehouse_id || session.warehouse_id || '';
+        if (toApprove.length > 0 && !warehouseId) {
+          res.status(400).json({ error: 'warehouse_id is required when approving' });
+          return;
+        }
+
         const reviewer = userInfo(req).email;
         const now = new Date();
 
-        for (const change of session.changes) {
+        // Reject path is just metadata.
+        for (const change of toReject) {
+          await query(
+            `UPDATE midas.change_proposals
+                SET decision = 'rejected',
+                    apply_status = NULL,
+                    apply_error = NULL,
+                    applied_at = NULL
+              WHERE change_id = $1`,
+            [change.change_id],
+          );
+        }
+
+        // Approve path runs SQL through the user's warehouse, OBO.
+        const ws = toApprove.length > 0 ? userWorkspaceClient(req) : null;
+        for (const change of toApprove) {
           const ident = escapeIdent(change.table_fqn);
           const kind = isView(change.table_type) ? 'VIEW' : 'TABLE';
           const value = escComment(change.proposed_value);
@@ -249,51 +311,81 @@ export function registerSessionRoutes(appkit: AppKit) {
           } else {
             await query(
               `UPDATE midas.change_proposals
-                 SET apply_status = 'error', apply_error = $1, applied_at = $2
+                 SET decision = 'approved',
+                     apply_status = 'error',
+                     apply_error = $1,
+                     applied_at = $2
                WHERE change_id = $3`,
-              ['skipped — invalid change shape', now, change.change_id],
+              ['invalid change shape', now, change.change_id],
             );
             continue;
           }
           try {
-            await executeSql(ws, warehouseId, stmt);
+            await executeSql(ws!, warehouseId, stmt);
             await query(
               `UPDATE midas.change_proposals
-                 SET apply_status = 'success', apply_error = NULL, applied_at = $1
+                 SET decision = 'approved',
+                     apply_status = 'success',
+                     apply_error = NULL,
+                     applied_at = $1
                WHERE change_id = $2`,
               [now, change.change_id],
             );
           } catch (e) {
             await query(
               `UPDATE midas.change_proposals
-                 SET apply_status = 'error', apply_error = $1, applied_at = $2
+                 SET decision = 'approved',
+                     apply_status = 'error',
+                     apply_error = $1,
+                     applied_at = $2
                WHERE change_id = $3`,
               [String((e as Error).message ?? e).slice(0, 1000), now, change.change_id],
             );
           }
         }
 
-        // Determine overall outcome: if any change failed, mark session
-        // status='applied_partial', else 'approved'. Either way we record
-        // reviewer + applied_at.
-        const after = await query<{ failed: string }>(
-          `SELECT COUNT(*)::text AS failed
-             FROM midas.change_proposals
-            WHERE session_id = $1 AND apply_status = 'error'`,
+        // Recompute the session status from the change population.
+        const agg = await query<{
+          total: string;
+          undecided: string;
+          approved_ok: string;
+          approved_err: string;
+          rejected: string;
+        }>(
+          `SELECT
+              COUNT(*)::text AS total,
+              COUNT(*) FILTER (WHERE decision IS NULL)::text AS undecided,
+              COUNT(*) FILTER (WHERE decision = 'approved' AND apply_status = 'success')::text AS approved_ok,
+              COUNT(*) FILTER (WHERE decision = 'approved' AND apply_status = 'error')::text AS approved_err,
+              COUNT(*) FILTER (WHERE decision = 'rejected')::text AS rejected
+            FROM midas.change_proposals
+           WHERE session_id = $1`,
           [id],
         );
-        const failedCount = Number(after.rows[0]?.failed ?? 0);
-        const finalStatus = failedCount > 0 ? 'applied_partial' : 'approved';
+        const a = agg.rows[0]!;
+        const total = Number(a.total);
+        const undecidedCount = Number(a.undecided);
+        const ok = Number(a.approved_ok);
+        const errs = Number(a.approved_err);
+        const rejectedCount = Number(a.rejected);
+
+        let newStatus = 'pending';
+        if (undecidedCount === 0) {
+          if (errs > 0 || (ok > 0 && rejectedCount > 0)) newStatus = 'partial';
+          else if (ok === total) newStatus = 'approved';
+          else if (rejectedCount === total) newStatus = 'rejected';
+          else newStatus = 'partial';
+        }
 
         await query(
           `UPDATE midas.sessions
               SET status = $1,
                   reviewed_by = $2,
-                  review_comment = $3,
+                  review_comment = COALESCE($3, review_comment),
                   reviewed_at = $4,
-                  applied_at = $4
-            WHERE session_id = $5`,
-          [finalStatus, reviewer, body.review_comment ?? null, now, id],
+                  applied_at = CASE WHEN $5 > 0 THEN $4 ELSE applied_at END
+            WHERE session_id = $6`,
+          [newStatus, reviewer, body.review_comment ?? null, now, ok + errs, id],
         );
 
         const updated = await getSessionWithChanges(id);
@@ -303,37 +395,7 @@ export function registerSessionRoutes(appkit: AppKit) {
       }
     });
 
-    /** Reject a pending session. ADMIN ONLY. */
-    app.post('/api/sessions/:id/reject', async (req: Request, res: Response) => {
-      try {
-        if (!(await isWorkspaceAdmin(req))) {
-          res.status(403).json({ error: 'workspace admin required to reject' });
-          return;
-        }
-        const id = String(req.params.id);
-        const body = req.body as { review_comment?: string };
-        const reviewer = userInfo(req).email;
-        const now = new Date();
-        const r = await query(
-          `UPDATE midas.sessions
-              SET status = 'rejected', reviewed_by = $1,
-                  review_comment = $2, reviewed_at = $3
-            WHERE session_id = $4 AND status = 'pending'
-           RETURNING session_id`,
-          [reviewer, body.review_comment ?? null, now, id],
-        );
-        if (r.rowCount === 0) {
-          res.status(400).json({ error: 'session not pending or not found' });
-          return;
-        }
-        const updated = await getSessionWithChanges(id);
-        res.json(updated);
-      } catch (err) {
-        res.status(500).json({ error: String((err as Error).message ?? err) });
-      }
-    });
-
-    /** Resubmit a previously rejected session (owner only). */
+    /** Resubmit a fully-rejected session (owner only). Clears all decisions. */
     app.post('/api/sessions/:id/resubmit', async (req: Request, res: Response) => {
       try {
         const id = String(req.params.id);
@@ -343,6 +405,7 @@ export function registerSessionRoutes(appkit: AppKit) {
           `UPDATE midas.sessions
               SET status = 'pending', reviewed_by = NULL,
                   review_comment = NULL, reviewed_at = NULL,
+                  applied_at = NULL,
                   submitted_at = $1
             WHERE session_id = $2 AND status = 'rejected'
               AND submitted_by = $3
@@ -353,6 +416,13 @@ export function registerSessionRoutes(appkit: AppKit) {
           res.status(403).json({ error: 'cannot resubmit (not the submitter or not rejected)' });
           return;
         }
+        await query(
+          `UPDATE midas.change_proposals
+              SET decision = NULL, apply_status = NULL,
+                  apply_error = NULL, applied_at = NULL
+            WHERE session_id = $1`,
+          [id],
+        );
         const updated = await getSessionWithChanges(id);
         res.json(updated);
       } catch (err) {

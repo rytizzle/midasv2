@@ -132,7 +132,7 @@ export default function App() {
                   : 'text-muted-foreground hover:bg-muted'
               }`}
             >
-              Sessions
+              Submissions
             </button>
           </nav>
           <div className="flex items-center gap-3">
@@ -1095,7 +1095,7 @@ function SessionsView({
   isAdmin: boolean;
   warehouseId: string;
 }) {
-  type Scope = 'mine' | 'pending' | 'all';
+  type Scope = 'mine' | 'pending';
   // Non-admins only ever see their own — scope is locked to 'mine'.
   // Admins default to the 'pending' (review queue) tab.
   const [scope, setScope] = useState<Scope>(isAdmin ? 'pending' : 'mine');
@@ -1106,12 +1106,7 @@ function SessionsView({
   const refresh = async () => {
     setError('');
     try {
-      const opts =
-        scope === 'mine'
-          ? { mine: true }
-          : scope === 'pending'
-            ? { status: 'pending' }
-            : {};
+      const opts = scope === 'mine' ? { mine: true } : { status: 'pending' };
       const list = await api.listSessions(opts);
       setSessions(list);
     } catch (e) {
@@ -1125,14 +1120,14 @@ function SessionsView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scope, isAdmin]);
 
-  const scopeOptions: Scope[] = isAdmin ? ['pending', 'mine', 'all'] : ['mine'];
+  const scopeOptions: Scope[] = isAdmin ? ['pending', 'mine'] : ['mine'];
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[360px_1fr] gap-4">
       <Card className="lg:max-h-[calc(100vh-180px)] overflow-y-auto">
         <CardHeader>
           <div className="flex items-center justify-between">
-            <CardTitle className="text-base">Sessions</CardTitle>
+            <CardTitle className="text-base">Submissions</CardTitle>
             <Button variant="outline" size="sm" onClick={refresh}>
               Refresh
             </Button>
@@ -1150,14 +1145,14 @@ function SessionsView({
                       : 'text-muted-foreground hover:bg-muted'
                   }`}
                 >
-                  {s === 'pending' ? 'Pending review' : s === 'mine' ? 'My submissions' : 'All'}
+                  {s === 'pending' ? 'Pending review' : 'My submissions'}
                 </button>
               ))}
             </div>
           )}
           {!isAdmin && (
             <p className="text-[11px] text-muted-foreground pt-1">
-              You see only sessions you submitted. Workspace admins can review pending submissions.
+              You see only submissions you created. Workspace admins review pending submissions.
             </p>
           )}
         </CardHeader>
@@ -1167,7 +1162,7 @@ function SessionsView({
           )}
           {sessions == null && <Spinner />}
           {sessions && sessions.length === 0 && (
-            <p className="text-sm text-muted-foreground">No sessions in this view.</p>
+            <p className="text-sm text-muted-foreground">No submissions in this view.</p>
           )}
           {sessions?.map((s) => (
             <button
@@ -1215,7 +1210,7 @@ function SessionsView({
         ) : (
           <Card>
             <CardContent className="pt-6 text-sm text-muted-foreground">
-              Select a session on the left to review changes.
+              Select a submission on the left to review changes.
             </CardContent>
           </Card>
         )}

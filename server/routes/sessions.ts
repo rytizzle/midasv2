@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { query, ensureReady } from '../lib/lakebase';
 import { userInfo, userWorkspaceClient } from '../lib/user-client';
 import { escapeIdent, executeSql } from '../lib/sql';
+import { isWorkspaceAdmin } from '../lib/admin';
 
 interface AppKit {
   server: { extend(fn: (app: Application) => void): void };
@@ -126,12 +127,18 @@ export function registerSessionRoutes(appkit: AppKit) {
       }
     });
 
-    /** List sessions. ?mine=1 → only my submissions. ?status=pending → filter. */
+    /**
+     * List sessions. Non-admins ALWAYS see only their own (ignoring any
+     * `mine` param). Admins can pass `mine=1` to filter to their own
+     * submissions, or omit to see everything.
+     * `?status=pending` filters by status.
+     */
     app.get('/api/sessions', async (req: Request, res: Response) => {
       try {
         const status = typeof req.query.status === 'string' ? req.query.status : null;
-        const mine = req.query.mine === '1';
         const me = userInfo(req).email;
+        const admin = await isWorkspaceAdmin(req);
+        const restrictToOwn = !admin || req.query.mine === '1';
 
         const filters: string[] = [];
         const params: unknown[] = [];
@@ -139,7 +146,7 @@ export function registerSessionRoutes(appkit: AppKit) {
           params.push(status);
           filters.push(`status = $${params.length}`);
         }
-        if (mine) {
+        if (restrictToOwn) {
           params.push(me);
           filters.push(`submitted_by = $${params.length}`);
         }
@@ -165,6 +172,17 @@ export function registerSessionRoutes(appkit: AppKit) {
       }
     });
 
+    /** Caller's identity + admin status. */
+    app.get('/api/me/role', async (req: Request, res: Response) => {
+      try {
+        const u = userInfo(req);
+        const admin = await isWorkspaceAdmin(req);
+        res.json({ email: u.email, name: u.name, is_admin: admin });
+      } catch (err) {
+        res.status(500).json({ error: String((err as Error).message ?? err) });
+      }
+    });
+
     /** Get one session with all its proposed changes. */
     app.get('/api/sessions/:id', async (req: Request, res: Response) => {
       try {
@@ -174,16 +192,27 @@ export function registerSessionRoutes(appkit: AppKit) {
           res.status(404).json({ error: 'not found' });
           return;
         }
+        const me = userInfo(req).email;
+        const admin = await isWorkspaceAdmin(req);
+        if (!admin && session.submitted_by !== me) {
+          // Don't leak the existence of other people's sessions.
+          res.status(404).json({ error: 'not found' });
+          return;
+        }
         res.json(session);
       } catch (err) {
         res.status(500).json({ error: String((err as Error).message ?? err) });
       }
     });
 
-    /** Approve a pending session: apply changes to UC, record results. */
+    /** Approve a pending session: apply changes to UC, record results. ADMIN ONLY. */
     app.post('/api/sessions/:id/approve', async (req: Request, res: Response) => {
       const id = String(req.params.id);
       try {
+        if (!(await isWorkspaceAdmin(req))) {
+          res.status(403).json({ error: 'workspace admin required to approve' });
+          return;
+        }
         const body = req.body as { review_comment?: string; warehouse_id?: string };
         const session = await getSessionWithChanges(id);
         if (!session) {
@@ -274,9 +303,13 @@ export function registerSessionRoutes(appkit: AppKit) {
       }
     });
 
-    /** Reject a pending session. */
+    /** Reject a pending session. ADMIN ONLY. */
     app.post('/api/sessions/:id/reject', async (req: Request, res: Response) => {
       try {
+        if (!(await isWorkspaceAdmin(req))) {
+          res.status(403).json({ error: 'workspace admin required to reject' });
+          return;
+        }
         const id = String(req.params.id);
         const body = req.body as { review_comment?: string };
         const reviewer = userInfo(req).email;
@@ -300,10 +333,11 @@ export function registerSessionRoutes(appkit: AppKit) {
       }
     });
 
-    /** Resubmit a previously rejected session (returns it to pending). */
+    /** Resubmit a previously rejected session (owner only). */
     app.post('/api/sessions/:id/resubmit', async (req: Request, res: Response) => {
       try {
         const id = String(req.params.id);
+        const me = userInfo(req).email;
         const now = new Date();
         const r = await query(
           `UPDATE midas.sessions
@@ -311,11 +345,12 @@ export function registerSessionRoutes(appkit: AppKit) {
                   review_comment = NULL, reviewed_at = NULL,
                   submitted_at = $1
             WHERE session_id = $2 AND status = 'rejected'
+              AND submitted_by = $3
            RETURNING session_id`,
-          [now, id],
+          [now, id, me],
         );
         if (r.rowCount === 0) {
-          res.status(400).json({ error: 'session not in rejected state' });
+          res.status(403).json({ error: 'cannot resubmit (not the submitter or not rejected)' });
           return;
         }
         const updated = await getSessionWithChanges(id);
@@ -325,11 +360,12 @@ export function registerSessionRoutes(appkit: AppKit) {
       }
     });
 
-    /** Update a proposed value on a rejected session before resubmit. */
+    /** Update a proposed value on a rejected session before resubmit (owner only). */
     app.patch('/api/sessions/:id/changes/:changeId', async (req: Request, res: Response) => {
       try {
         const id = String(req.params.id);
         const changeId = String(req.params.changeId);
+        const me = userInfo(req).email;
         const body = req.body as { proposed_value?: string };
         if (typeof body.proposed_value !== 'string') {
           res.status(400).json({ error: 'proposed_value is required' });
@@ -340,13 +376,17 @@ export function registerSessionRoutes(appkit: AppKit) {
               SET proposed_value = $1, apply_status = NULL, apply_error = NULL,
                   applied_at = NULL
             WHERE change_id = $2 AND session_id = $3
-              AND EXISTS (SELECT 1 FROM midas.sessions
-                          WHERE session_id = $3 AND status = 'rejected')
+              AND EXISTS (
+                SELECT 1 FROM midas.sessions
+                 WHERE session_id = $3
+                   AND status = 'rejected'
+                   AND submitted_by = $4
+              )
            RETURNING change_id`,
-          [body.proposed_value, changeId, id],
+          [body.proposed_value, changeId, id, me],
         );
         if (r.rowCount === 0) {
-          res.status(400).json({ error: 'change not editable (session must be rejected)' });
+          res.status(403).json({ error: 'change not editable (must own a rejected session)' });
           return;
         }
         res.json({ ok: true });

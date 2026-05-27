@@ -31,6 +31,7 @@ import {
 import {
   api,
   type GeneratedMetadata,
+  type MeRole,
   type ProposalChange,
   type SessionDetail,
   type SessionSummary,
@@ -55,7 +56,7 @@ const DEFAULT_COLUMN_TEMPLATE =
 type AppView = 'wizard' | 'sessions';
 
 export default function App() {
-  const [user, setUser] = useState<{ email: string; name: string } | null>(null);
+  const [user, setUser] = useState<MeRole | null>(null);
   const [warehouses, setWarehouses] = useState<Warehouse[]>([]);
   const [warehouseId, setWarehouseId] = useState<string>('');
   const [view, setView] = useState<AppView>('wizard');
@@ -71,7 +72,10 @@ export default function App() {
   const [metadata, setMetadata] = useState<Record<string, GeneratedMetadata> | null>(null);
 
   useEffect(() => {
-    api.getMe().then(setUser).catch(() => setUser({ email: '', name: '' }));
+    api
+      .getMyRole()
+      .then(setUser)
+      .catch(() => setUser({ email: '', name: '', is_admin: false }));
   }, []);
 
   useEffect(() => {
@@ -140,6 +144,7 @@ export default function App() {
             {user && (
               <Badge variant="secondary" className="text-xs">
                 {user.email || 'anonymous'}
+                {user.is_admin ? ' · admin' : ''}
               </Badge>
             )}
           </div>
@@ -193,7 +198,11 @@ export default function App() {
           />
         )}
         {view === 'sessions' && (
-          <SessionsView userEmail={user?.email ?? ''} warehouseId={warehouseId} />
+          <SessionsView
+            userEmail={user?.email ?? ''}
+            isAdmin={user?.is_admin ?? false}
+            warehouseId={warehouseId}
+          />
         )}
       </main>
     </div>
@@ -1079,13 +1088,17 @@ function timeAgo(iso: string | null | undefined): string {
 
 function SessionsView({
   userEmail,
+  isAdmin,
   warehouseId,
 }: {
   userEmail: string;
+  isAdmin: boolean;
   warehouseId: string;
 }) {
   type Scope = 'mine' | 'pending' | 'all';
-  const [scope, setScope] = useState<Scope>('pending');
+  // Non-admins only ever see their own — scope is locked to 'mine'.
+  // Admins default to the 'pending' (review queue) tab.
+  const [scope, setScope] = useState<Scope>(isAdmin ? 'pending' : 'mine');
   const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
   const [error, setError] = useState<string>('');
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -1110,7 +1123,9 @@ function SessionsView({
   useEffect(() => {
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope]);
+  }, [scope, isAdmin]);
+
+  const scopeOptions: Scope[] = isAdmin ? ['pending', 'mine', 'all'] : ['mine'];
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[360px_1fr] gap-4">
@@ -1122,22 +1137,29 @@ function SessionsView({
               Refresh
             </Button>
           </div>
-          <div className="flex gap-1 pt-2">
-            {(['pending', 'mine', 'all'] as Scope[]).map((s) => (
-              <button
-                key={s}
-                type="button"
-                onClick={() => setScope(s)}
-                className={`text-xs px-2.5 py-1 rounded-full transition-colors ${
-                  scope === s
-                    ? 'bg-primary text-primary-foreground'
-                    : 'text-muted-foreground hover:bg-muted'
-                }`}
-              >
-                {s === 'pending' ? 'Pending review' : s === 'mine' ? 'My submissions' : 'All'}
-              </button>
-            ))}
-          </div>
+          {scopeOptions.length > 1 && (
+            <div className="flex gap-1 pt-2">
+              {scopeOptions.map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  onClick={() => setScope(s)}
+                  className={`text-xs px-2.5 py-1 rounded-full transition-colors ${
+                    scope === s
+                      ? 'bg-primary text-primary-foreground'
+                      : 'text-muted-foreground hover:bg-muted'
+                  }`}
+                >
+                  {s === 'pending' ? 'Pending review' : s === 'mine' ? 'My submissions' : 'All'}
+                </button>
+              ))}
+            </div>
+          )}
+          {!isAdmin && (
+            <p className="text-[11px] text-muted-foreground pt-1">
+              You see only sessions you submitted. Workspace admins can review pending submissions.
+            </p>
+          )}
         </CardHeader>
         <CardContent className="space-y-1">
           {error && (
@@ -1186,6 +1208,7 @@ function SessionsView({
             key={activeId}
             sessionId={activeId}
             userEmail={userEmail}
+            isAdmin={isAdmin}
             warehouseId={warehouseId}
             onChanged={refresh}
           />
@@ -1204,11 +1227,13 @@ function SessionsView({
 function SessionDetailCard({
   sessionId,
   userEmail,
+  isAdmin,
   warehouseId,
   onChanged,
 }: {
   sessionId: string;
   userEmail: string;
+  isAdmin: boolean;
   warehouseId: string;
   onChanged: () => void;
 }) {
@@ -1248,7 +1273,7 @@ function SessionDetailCard({
   }
 
   const isOwn = detail.submitted_by === userEmail;
-  const canApprove = detail.status === 'pending';
+  const canApprove = detail.status === 'pending' && isAdmin;
   const canResubmit = detail.status === 'rejected' && isOwn;
 
   const groupedByTable = new Map<string, ProposalChange[]>();

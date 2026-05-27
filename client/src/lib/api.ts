@@ -129,8 +129,15 @@ export interface SessionDetail extends Omit<SessionSummary, 'change_count'> {
   changes: ProposalChange[];
 }
 
+export interface MeRole {
+  email: string;
+  name: string;
+  is_admin: boolean;
+}
+
 export const api = {
   getMe: () => getJSON<UserInfo>('/api/catalog/me'),
+  getMyRole: () => getJSON<MeRole>('/api/me/role'),
   getWarehouses: () => getJSON<Warehouse[]>('/api/catalog/warehouses'),
   getCatalogs: () => getJSON<Catalog[]>('/api/catalog/catalogs'),
   getSchemas: (catalog: string) =>

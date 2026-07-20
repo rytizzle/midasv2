@@ -74,8 +74,8 @@ export interface GeneratedMetadata {
 export interface GenerationContext {
   blurb: string;
   docs: string;
-  tableTemplate: string;
-  columnTemplate: string;
+  tableTemplate?: string;
+  columnTemplate?: string;
 }
 
 /** Per-table tier override sent to generation (DAWG 0003). */

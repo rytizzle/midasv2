@@ -43,19 +43,31 @@ import {
   type Warehouse,
 } from './lib/api';
 import { diffWords, hasChange } from './lib/diff';
-import { DEFAULT_TIER, tierSpec } from '@shared/tiers';
+import { DEFAULT_TIER, TIER_ORDER, TIER_SPECS, tierSpec } from '@shared/tiers';
 
 const STEPS = ['Tables', 'Context', 'Profile & Generate', 'Review & Apply'] as const;
 
-const DEFAULT_TABLE_TEMPLATE = [
-  'General Description: what this table contains and its primary purpose.',
-  'Business Value: who uses this data and what decisions or workflows it supports.',
-  'Key Relationships: tables it joins to and the join keys.',
-  'Filters & Segments: common ways users filter or group this data.',
-].join('\n');
+/** Per-tier structure templates, editable in the Context step. */
+type TierTemplates = Record<Tier, { tableTemplate: string; columnTemplate: string }>;
 
-const DEFAULT_COLUMN_TEMPLATE =
-  "1-2 sentences: business definition, then typical values or categories. Example: 'Total hours logged. Common values: 1, 2, 4, 8 hours.'";
+/** Seed the editable per-tier templates from the DAWG 0003 specs. */
+function defaultTierTemplates(): TierTemplates {
+  const out = {} as TierTemplates;
+  for (const t of TIER_ORDER) {
+    out[t] = {
+      tableTemplate: TIER_SPECS[t].tableTemplate,
+      columnTemplate: TIER_SPECS[t].columnTemplate,
+    };
+  }
+  return out;
+}
+
+interface WizardContext {
+  blurb: string;
+  docs: string;
+  /** Per-tier table/column structure templates (DAWG 0003, editable). */
+  tierTemplates: TierTemplates;
+}
 
 type AppView = 'wizard' | 'sessions';
 
@@ -66,14 +78,12 @@ export default function App() {
   const [view, setView] = useState<AppView>('wizard');
   const [step, setStep] = useState(0);
   const [selectedTables, setSelectedTables] = useState<Table[]>([]);
-  // Templates start empty: by default each table uses its DAWG 0003 tier
-  // template (resolved server-side). Filling these overrides the tier template
-  // for every table in the batch.
-  const [context, setContext] = useState({
+  // Per-tier templates seed from the DAWG 0003 specs and are editable in the
+  // Context step; each table uses the template for its tier.
+  const [context, setContext] = useState<WizardContext>({
     blurb: '',
     docs: '',
-    tableTemplate: '',
-    columnTemplate: '',
+    tierTemplates: defaultTierTemplates(),
   });
   const [profiles, setProfiles] = useState<Record<string, TableProfile> | null>(null);
   const [metadata, setMetadata] = useState<Record<string, GeneratedMetadata> | null>(null);
@@ -109,6 +119,12 @@ export default function App() {
     setProfiles(null);
     setMetadata(null);
   };
+
+  // Tiers present in the current selection, so the Context step can surface the
+  // relevant per-tier templates first.
+  const tiersInUse = new Set<Tier>(
+    selectedTables.map((t) => t.tier ?? DEFAULT_TIER),
+  );
 
   return (
     <div className="min-h-screen bg-background">
@@ -173,6 +189,7 @@ export default function App() {
           <ContextStep
             context={context}
             onChange={setContext}
+            tiersInUse={tiersInUse}
             onBack={() => setStep(0)}
             onNext={() => setStep(2)}
           />
@@ -934,21 +951,53 @@ function TablesStep({
 function ContextStep({
   context,
   onChange,
+  tiersInUse,
   onBack,
   onNext,
 }: {
-  context: { blurb: string; docs: string; tableTemplate: string; columnTemplate: string };
-  onChange: (c: typeof context) => void;
+  context: WizardContext;
+  onChange: (c: WizardContext) => void;
+  /** Tiers present in the current selection — surfaced first for convenience. */
+  tiersInUse: Set<Tier>;
   onBack: () => void;
   onNext: () => void;
 }) {
+  // Default the active tier tab to one that's actually in the selection.
+  const firstInUse = TIER_ORDER.find((t) => tiersInUse.has(t)) ?? DEFAULT_TIER;
+  const [activeTier, setActiveTier] = useState<Tier>(firstInUse);
+
+  const spec = tierSpec(activeTier);
+  const tpl = context.tierTemplates[activeTier];
+  const setTpl = (patch: Partial<{ tableTemplate: string; columnTemplate: string }>) =>
+    onChange({
+      ...context,
+      tierTemplates: {
+        ...context.tierTemplates,
+        [activeTier]: { ...context.tierTemplates[activeTier], ...patch },
+      },
+    });
+  const resetTier = () =>
+    onChange({
+      ...context,
+      tierTemplates: {
+        ...context.tierTemplates,
+        [activeTier]: {
+          tableTemplate: TIER_SPECS[activeTier].tableTemplate,
+          columnTemplate: TIER_SPECS[activeTier].columnTemplate,
+        },
+      },
+    });
+  const isCustomized =
+    tpl.tableTemplate !== TIER_SPECS[activeTier].tableTemplate ||
+    tpl.columnTemplate !== TIER_SPECS[activeTier].columnTemplate;
+
   return (
     <Card>
       <CardHeader>
         <CardTitle>Add context</CardTitle>
         <CardDescription>
-          Tell the model what this data is about. By default each table uses the DAWG 0003 template
-          for its tier; the templates below override that for every table when set.
+          Tell the model what this data is about. Each table is structured with the template for its
+          DAWG 0003 tier — pick a tier below to view or edit how its metadata is structured.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -961,75 +1010,73 @@ function ContextStep({
             rows={4}
           />
         </div>
-        <Tabs defaultValue="table">
-          <TabsList>
-            <TabsTrigger value="table">Table template</TabsTrigger>
-            <TabsTrigger value="column">Column template</TabsTrigger>
-          </TabsList>
-          <TabsContent value="table" className="space-y-2">
-            <div className="flex items-center justify-between">
-              <p className="text-[11px] text-muted-foreground">
-                Leave blank to use each table's DAWG 0003 tier template.
-              </p>
-              <div className="flex gap-1">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="text-xs h-7"
-                  onClick={() => onChange({ ...context, tableTemplate: DEFAULT_TABLE_TEMPLATE })}
+
+        <div className="space-y-2">
+          <Label className="text-xs">Metadata structure by tier</Label>
+          <div className="flex flex-wrap gap-1.5">
+            {TIER_ORDER.map((t) => {
+              const inUse = tiersInUse.has(t);
+              const customized =
+                context.tierTemplates[t].tableTemplate !== TIER_SPECS[t].tableTemplate ||
+                context.tierTemplates[t].columnTemplate !== TIER_SPECS[t].columnTemplate;
+              return (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => setActiveTier(t)}
+                  className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                    activeTier === t
+                      ? 'bg-primary text-primary-foreground border-primary'
+                      : 'bg-muted text-foreground border-transparent hover:bg-muted/70'
+                  }`}
+                  title={inUse ? 'Present in your selection' : 'Not in your current selection'}
                 >
-                  Load standard default
-                </Button>
-                {context.tableTemplate && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="text-xs h-7"
-                    onClick={() => onChange({ ...context, tableTemplate: '' })}
-                  >
-                    Clear
-                  </Button>
-                )}
-              </div>
-            </div>
+                  {TIER_SPECS[t].label}
+                  {inUse && <span className="ml-1.5 opacity-70">•</span>}
+                  {customized && <span className="ml-1 opacity-70">✎</span>}
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            • = present in your selection · ✎ = edited from the DAWG 0003 default.
+            {spec.critical && ' Tier 0 is critical — the richest structure.'}
+          </p>
+        </div>
+
+        <Tabs defaultValue="table">
+          <div className="flex items-center justify-between">
+            <TabsList>
+              <TabsTrigger value="table">Table template</TabsTrigger>
+              <TabsTrigger value="column">Column template</TabsTrigger>
+            </TabsList>
+            {isCustomized && (
+              <Button variant="ghost" size="sm" className="text-xs h-7" onClick={resetTier}>
+                Reset {spec.label} to DAWG default
+              </Button>
+            )}
+          </div>
+          <TabsContent value="table" className="space-y-2">
+            <p className="text-[11px] text-muted-foreground">
+              How {spec.label} table comments are structured.
+            </p>
             <Textarea
-              value={context.tableTemplate}
-              placeholder={`Per-tier template used by default. Example (standard tiers):\n${DEFAULT_TABLE_TEMPLATE}`}
-              onChange={(e) => onChange({ ...context, tableTemplate: e.target.value })}
+              value={tpl.tableTemplate}
+              onChange={(e) => setTpl({ tableTemplate: e.target.value })}
               rows={8}
               className="font-mono text-xs"
             />
           </TabsContent>
           <TabsContent value="column" className="space-y-2">
-            <div className="flex items-center justify-between">
-              <p className="text-[11px] text-muted-foreground">
-                Leave blank to use each table's DAWG 0003 tier template.
-              </p>
-              <div className="flex gap-1">
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="text-xs h-7"
-                  onClick={() => onChange({ ...context, columnTemplate: DEFAULT_COLUMN_TEMPLATE })}
-                >
-                  Load standard default
-                </Button>
-                {context.columnTemplate && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="text-xs h-7"
-                    onClick={() => onChange({ ...context, columnTemplate: '' })}
-                  >
-                    Clear
-                  </Button>
-                )}
-              </div>
-            </div>
+            <p className="text-[11px] text-muted-foreground">
+              How {spec.label} column descriptions are structured.
+              {spec.columnDescriptionsRequired
+                ? ' Column descriptions are required at this tier.'
+                : ''}
+            </p>
             <Textarea
-              value={context.columnTemplate}
-              placeholder={`Per-tier template used by default. Example:\n${DEFAULT_COLUMN_TEMPLATE}`}
-              onChange={(e) => onChange({ ...context, columnTemplate: e.target.value })}
+              value={tpl.columnTemplate}
+              onChange={(e) => setTpl({ columnTemplate: e.target.value })}
               rows={4}
               className="font-mono text-xs"
             />
@@ -1062,7 +1109,7 @@ function ProfileStep({
   tables: Table[];
   setTables: (t: Table[]) => void;
   warehouseId: string;
-  context: { blurb: string; docs: string; tableTemplate: string; columnTemplate: string };
+  context: WizardContext;
   profiles: Record<string, TableProfile> | null;
   metadata: Record<string, GeneratedMetadata> | null;
   setProfiles: (p: Record<string, TableProfile> | null) => void;
@@ -1102,13 +1149,23 @@ function ProfileStep({
       setProfiles(p);
 
       setStatus('generating');
-      // Per-table tier context (DAWG 0003): drive the template off each table's
-      // tier so critical Tier 0 tables get the richer prompt.
+      // Per-table tier context (DAWG 0003): send each table's tier plus the
+      // (possibly user-edited) structure template for that tier, so critical
+      // Tier 0 tables get the richer structure and edits in the Context step
+      // flow through per tier.
       const tiers: Record<string, TierContext> = {};
       for (const t of working) {
-        if (t.tier) tiers[t.full_name] = { tier: t.tier };
+        const tier = t.tier ?? DEFAULT_TIER;
+        const tpl = context.tierTemplates[tier];
+        tiers[t.full_name] = {
+          tier,
+          tableTemplate: tpl.tableTemplate,
+          columnTemplate: tpl.columnTemplate,
+        };
       }
-      const m = await api.generate(p, context, tiers);
+      // Shared context now only carries the free-text blurb/docs; per-tier
+      // templates travel in `tiers`.
+      const m = await api.generate(p, { blurb: context.blurb, docs: context.docs }, tiers);
       setMetadata(m);
       setStatus('done');
     } catch (e) {

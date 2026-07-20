@@ -39,14 +39,24 @@ export function buildPrompt(
   if (ctx.docs) userContextParts.push(`Additional docs: ${ctx.docs}`);
   const userContext = userContextParts.join('\n\n') || 'None provided';
 
-  // Tier-specific templates (DAWG 0003) take precedence over the shared
-  // context templates. If a per-table tier is supplied, use its template
-  // unless the user explicitly overrode it in the shared context.
+  // Tier-specific templates (DAWG 0003) drive the structure. Precedence, most
+  // specific first: an explicit per-table override → the shared-context
+  // override → the table's tier template. Treat blank/whitespace strings as
+  // "unset" so an empty shared-context field doesn't block the tier template
+  // (`??` alone would stop at an empty string).
+  const firstNonBlank = (...vals: Array<string | undefined>): string | undefined =>
+    vals.find((v) => v != null && v.trim() !== '');
   const spec = tierCtx?.tier ? tierSpec(tierCtx.tier) : null;
-  const effectiveTableTemplate =
-    tierCtx?.tableTemplate ?? ctx.tableTemplate ?? spec?.tableTemplate;
-  const effectiveColumnTemplate =
-    tierCtx?.columnTemplate ?? ctx.columnTemplate ?? spec?.columnTemplate;
+  const effectiveTableTemplate = firstNonBlank(
+    tierCtx?.tableTemplate,
+    ctx.tableTemplate,
+    spec?.tableTemplate,
+  );
+  const effectiveColumnTemplate = firstNonBlank(
+    tierCtx?.columnTemplate,
+    ctx.columnTemplate,
+    spec?.columnTemplate,
+  );
   const tierHeader = spec
     ? `\nDATA TIER: ${spec.label} (DAWG 0003). ${
         spec.critical

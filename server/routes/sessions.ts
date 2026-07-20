@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { query, ensureReady } from '../lib/lakebase';
 import { userInfo, userWorkspaceClient } from '../lib/user-client';
 import { escapeIdent, executeSql } from '../lib/sql';
-import { isWorkspaceAdmin } from '../lib/admin';
+import { isWorkspaceAdmin, callerGroups, adminOverrideGroup } from '../lib/admin';
+import { resolveTableTags, catalogOf } from '../lib/tags';
 
 interface AppKit {
   server: { extend(fn: (app: Application) => void): void };
@@ -33,6 +34,7 @@ interface ChangeRow {
   current_value: string | null;
   proposed_value: string;
   decision: 'approved' | 'rejected' | null;
+  owner_group: string | null;
   apply_status: string | null;
   apply_error: string | null;
   applied_at: Date | null;
@@ -95,6 +97,35 @@ export function registerSessionRoutes(appkit: AppKit) {
         const sessionId = randomUUID();
         const now = new Date();
 
+        // Resolve the owner group for each distinct table from its governed
+        // owner tag so approvals can be routed to the owning group. Best-effort:
+        // if the warehouse/tag lookup fails, changes fall back to owner_group =
+        // null (workspace-admin approval).
+        const ownerByTable = new Map<string, string | null>();
+        const warehouseId = body.warehouse_id ?? '';
+        if (warehouseId) {
+          const distinctTables = [...new Set(changes.map((c) => c.table_fqn))];
+          const byCatalog = new Map<string, string[]>();
+          for (const fqn of distinctTables) {
+            const cat = catalogOf(fqn);
+            if (!cat) continue;
+            const arr = byCatalog.get(cat) ?? [];
+            arr.push(fqn);
+            byCatalog.set(cat, arr);
+          }
+          try {
+            const ws = userWorkspaceClient(req);
+            for (const [cat, fqns] of byCatalog) {
+              const tags = await resolveTableTags(ws, warehouseId, cat, fqns);
+              for (const [fqn, info] of Object.entries(tags)) {
+                ownerByTable.set(fqn, info.ownerGroup);
+              }
+            }
+          } catch (e) {
+            console.warn('[sessions] owner-tag resolution failed:', (e as Error).message);
+          }
+        }
+
         await query(
           `INSERT INTO midas.sessions
             (session_id, submitted_by, submit_comment, status, warehouse_id,
@@ -107,8 +138,8 @@ export function registerSessionRoutes(appkit: AppKit) {
           await query(
             `INSERT INTO midas.change_proposals
               (change_id, session_id, table_fqn, table_type, kind,
-               column_name, current_value, proposed_value)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+               column_name, current_value, proposed_value, owner_group)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
             [
               randomUUID(),
               sessionId,
@@ -118,6 +149,7 @@ export function registerSessionRoutes(appkit: AppKit) {
               c.column_name ?? null,
               c.current_value ?? null,
               c.proposed_value,
+              ownerByTable.get(c.table_fqn) ?? null,
             ],
           );
         }
@@ -129,28 +161,53 @@ export function registerSessionRoutes(appkit: AppKit) {
     });
 
     /**
-     * List sessions. Non-admins ALWAYS see only their own (ignoring any
-     * `mine` param). Admins can pass `mine=1` to filter to their own
-     * submissions, or omit to see everything.
-     * `?status=pending` filters by status.
+     * List sessions. Visibility:
+     *   - your own submissions, always; plus
+     *   - if you're an approver (workspace admin, override-group member, or a
+     *     member of some owner group), sessions containing changes owned by a
+     *     group you can approve.
+     * `?mine=1` restricts to your own submissions.
+     * `?status=pending` filters by status (the review-queue tab).
      */
     app.get('/api/sessions', async (req: Request, res: Response) => {
       try {
         const status = typeof req.query.status === 'string' ? req.query.status : null;
         const me = userInfo(req).email;
         const admin = await isWorkspaceAdmin(req);
-        const restrictToOwn = !admin || req.query.mine === '1';
+        const groups = await callerGroups(req);
+        const override = adminOverrideGroup();
+        const canApproveAny = admin || (override != null && groups.includes(override));
+        const mineOnly = req.query.mine === '1';
 
         const filters: string[] = [];
         const params: unknown[] = [];
         if (status) {
           params.push(status);
-          filters.push(`status = $${params.length}`);
+          filters.push(`s.status = $${params.length}`);
         }
-        if (restrictToOwn) {
+
+        // Access predicate: own submissions OR (approver-visible changes).
+        if (mineOnly || (!admin && !canApproveAny && groups.length === 0)) {
           params.push(me);
-          filters.push(`submitted_by = $${params.length}`);
+          filters.push(`s.submitted_by = $${params.length}`);
+        } else if (!admin && !canApproveAny) {
+          // Non-admin with group memberships: own submissions, or a session
+          // that contains at least one change owned by one of their groups.
+          params.push(me);
+          const meParam = `$${params.length}`;
+          params.push(groups);
+          const groupsParam = `$${params.length}`;
+          filters.push(
+            `(s.submitted_by = ${meParam}
+              OR EXISTS (
+                SELECT 1 FROM midas.change_proposals cp
+                 WHERE cp.session_id = s.session_id
+                   AND lower(cp.owner_group) = ANY(${groupsParam})
+              ))`,
+          );
         }
+        // admins / override-group members: no access filter (see everything).
+
         const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
         const list = await query<SessionRow & { change_count: string }>(
           `SELECT s.*,
@@ -173,12 +230,24 @@ export function registerSessionRoutes(appkit: AppKit) {
       }
     });
 
-    /** Caller's identity + admin status. */
+    /** Caller's identity + admin status + group memberships (for approvals). */
     app.get('/api/me/role', async (req: Request, res: Response) => {
       try {
         const u = userInfo(req);
         const admin = await isWorkspaceAdmin(req);
-        res.json({ email: u.email, name: u.name, is_admin: admin });
+        const groups = await callerGroups(req);
+        const override = adminOverrideGroup();
+        // Can this user approve anything at all? (admin, override-group, or a
+        // member of at least one group — group-owned changes may exist).
+        const canApproveSomething =
+          admin || (override != null && groups.includes(override)) || groups.length > 0;
+        res.json({
+          email: u.email,
+          name: u.name,
+          is_admin: admin,
+          groups,
+          can_approve: canApproveSomething,
+        });
       } catch (err) {
         res.status(500).json({ error: String((err as Error).message ?? err) });
       }
@@ -195,7 +264,15 @@ export function registerSessionRoutes(appkit: AppKit) {
         }
         const me = userInfo(req).email;
         const admin = await isWorkspaceAdmin(req);
-        if (!admin && session.submitted_by !== me) {
+        const groups = new Set((await callerGroups(req)).map((g) => g.toLowerCase()));
+        const override = adminOverrideGroup();
+        const isApprover =
+          admin ||
+          (override != null && groups.has(override)) ||
+          session.changes.some(
+            (c) => c.owner_group && groups.has(c.owner_group.toLowerCase()),
+          );
+        if (!isApprover && session.submitted_by !== me) {
           // Don't leak the existence of other people's sessions.
           res.status(404).json({ error: 'not found' });
           return;
@@ -224,10 +301,6 @@ export function registerSessionRoutes(appkit: AppKit) {
     app.post('/api/sessions/:id/decide', async (req: Request, res: Response) => {
       const id = String(req.params.id);
       try {
-        if (!(await isWorkspaceAdmin(req))) {
-          res.status(403).json({ error: 'workspace admin required' });
-          return;
-        }
         const body = req.body as {
           approve_ids?: string[];
           reject_ids?: string[];
@@ -257,9 +330,42 @@ export function registerSessionRoutes(appkit: AppKit) {
           return;
         }
 
+        // Approval authority is per-owner-group. Resolve the caller's groups
+        // once, then gate each selected change on its owner_group. A caller may
+        // only decide changes owned by a group they belong to (workspace admins
+        // and the configured override group may decide anything, including
+        // untagged changes).
+        const admin = await isWorkspaceAdmin(req);
+        const groups = new Set(await callerGroups(req));
+        const override = adminOverrideGroup();
+        const mayDecide = (ownerGroup: string | null): boolean => {
+          if (admin) return true;
+          if (override && groups.has(override)) return true;
+          if (!ownerGroup) return false;
+          return groups.has(ownerGroup.toLowerCase());
+        };
+
         const undecided = new Set(
           session.changes.filter((c) => !c.decision).map((c) => c.change_id),
         );
+        const selectedUndecided = session.changes.filter(
+          (c) =>
+            (approveIds.has(c.change_id) || rejectIds.has(c.change_id)) &&
+            undecided.has(c.change_id),
+        );
+        // Reject the whole request if the caller lacks authority over any
+        // selected change — clearer than silently dropping some.
+        const forbidden = selectedUndecided.filter((c) => !mayDecide(c.owner_group));
+        if (forbidden.length > 0) {
+          const groupsNeeded = [
+            ...new Set(forbidden.map((c) => c.owner_group || '(workspace admin)')),
+          ];
+          res.status(403).json({
+            error: `not authorized to decide ${forbidden.length} selected change(s); approval requires membership in: ${groupsNeeded.join(', ')}`,
+          });
+          return;
+        }
+
         const toApprove = session.changes.filter(
           (c) => approveIds.has(c.change_id) && undecided.has(c.change_id),
         );

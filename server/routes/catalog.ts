@@ -1,10 +1,16 @@
 import type { Application, Request, Response } from 'express';
 import { userInfo, userWorkspaceClient } from '../lib/user-client';
 import { executeSql } from '../lib/sql';
+import { OWNER_TAG_KEY, TIER_TAG_KEY } from '../lib/tags';
+import { normalizeTier, DEFAULT_TIER } from '../../shared/tiers';
 
 interface AppKit {
   server: { extend(fn: (app: Application) => void): void };
 }
+
+// Hard cap so a runaway "show all" query can't try to hydrate an entire
+// 39k-table catalog into one response.
+const MAX_TABLE_PAGE = 500;
 
 export function registerCatalogRoutes(appkit: AppKit) {
   appkit.server.extend((app) => {
@@ -98,6 +104,172 @@ export function registerCatalogRoutes(appkit: AppKit) {
             columns,
             column_count: columns.length,
           });
+        }
+        res.json(out);
+      } catch (err) {
+        res.status(500).json({ error: String((err as Error).message ?? err) });
+      }
+    });
+
+    /**
+     * "Show all tables" — the default browse view.
+     *
+     * Lists tables across a whole catalog (all schemas) in one bounded
+     * INFORMATION_SCHEMA query, with server-side search + keyset-friendly
+     * pagination so a 39k-table catalog never streams in full. Joins the
+     * owner + data_tier governed tags so the UI can show tier/owner without
+     * an extra round trip.
+     *
+     * Query params:
+     *   catalog       (required)  catalog to browse
+     *   warehouse_id  (required)  warehouse for the metadata query
+     *   schema        (optional)  restrict to one schema
+     *   q             (optional)  case-insensitive substring on schema/table
+     *   limit         (optional)  page size, default 200, max 500
+     *   offset        (optional)  page offset, default 0
+     *
+     * Returns { tables: [...], total, limit, offset, has_more }. Lightweight:
+     * columns are NOT hydrated here (that happens on selection/profiling).
+     */
+    app.get('/api/catalog/all-tables', async (req: Request, res: Response) => {
+      try {
+        const catalog = String(req.query.catalog ?? '');
+        const warehouseId = String(req.query.warehouse_id ?? '');
+        const schema = String(req.query.schema ?? '');
+        const q = String(req.query.q ?? '').trim();
+        const limit = Math.min(
+          Math.max(Number(req.query.limit ?? 200) || 200, 1),
+          MAX_TABLE_PAGE,
+        );
+        const offset = Math.max(Number(req.query.offset ?? 0) || 0, 0);
+        if (!catalog || !warehouseId) {
+          res.status(400).json({ error: 'catalog and warehouse_id are required' });
+          return;
+        }
+
+        const escLit = (s: string) => "'" + s.replace(/'/g, "''") + "'";
+        const conds: string[] = [`t.table_schema <> 'information_schema'`];
+        if (schema) conds.push(`t.table_schema = ${escLit(schema)}`);
+        if (q) {
+          const like = `%${q.replace(/([%_\\])/g, '\\$1').toLowerCase()}%`;
+          conds.push(
+            `(lower(t.table_name) LIKE ${escLit(like)} ESCAPE '\\\\' ` +
+              `OR lower(t.table_schema) LIKE ${escLit(like)} ESCAPE '\\\\')`,
+          );
+        }
+        const where = conds.join(' AND ');
+        const ws = userWorkspaceClient(req);
+
+        // Total count for pagination UI.
+        const countRows = await executeSql(
+          ws,
+          warehouseId,
+          `SELECT COUNT(*) AS n
+             FROM ${catalog}.INFORMATION_SCHEMA.TABLES t
+            WHERE ${where}`,
+        );
+        const total = Number(countRows[0]?.n ?? 0);
+
+        // Page of tables, left-joined to owner + tier tags in one shot.
+        const rows = await executeSql(
+          ws,
+          warehouseId,
+          `SELECT t.table_schema AS schema_name,
+                  t.table_name   AS table_name,
+                  t.table_type   AS table_type,
+                  t.comment      AS comment,
+                  MAX(CASE WHEN lower(tg.tag_name) = ${escLit(
+                    OWNER_TAG_KEY.toLowerCase(),
+                  )} THEN tg.tag_value END) AS owner_group,
+                  MAX(CASE WHEN lower(tg.tag_name) = ${escLit(
+                    TIER_TAG_KEY.toLowerCase(),
+                  )} THEN tg.tag_value END) AS tier_raw
+             FROM ${catalog}.INFORMATION_SCHEMA.TABLES t
+             LEFT JOIN ${catalog}.INFORMATION_SCHEMA.TABLE_TAGS tg
+                    ON tg.schema_name = t.table_schema
+                   AND tg.table_name  = t.table_name
+                   AND lower(tg.tag_name) IN (${escLit(
+                     OWNER_TAG_KEY.toLowerCase(),
+                   )}, ${escLit(TIER_TAG_KEY.toLowerCase())})
+            WHERE ${where}
+            GROUP BY t.table_schema, t.table_name, t.table_type, t.comment
+            ORDER BY t.table_schema, t.table_name
+            LIMIT ${limit} OFFSET ${offset}`,
+        );
+
+        const tables = rows.map((r) => {
+          const schemaName = r.schema_name ?? '';
+          const name = r.table_name ?? '';
+          const tier = normalizeTier(r.tier_raw) ?? DEFAULT_TIER;
+          return {
+            name,
+            full_name: `${catalog}.${schemaName}.${name}`,
+            schema_name: schemaName,
+            table_type: r.table_type ?? 'TABLE',
+            comment: r.comment ?? '',
+            owner_group: r.owner_group ?? null,
+            tier,
+            tier_tagged: normalizeTier(r.tier_raw) != null,
+            columns: [],
+            column_count: 0,
+          };
+        });
+
+        res.json({
+          tables,
+          total,
+          limit,
+          offset,
+          has_more: offset + tables.length < total,
+        });
+      } catch (err) {
+        res.status(500).json({ error: String((err as Error).message ?? err) });
+      }
+    });
+
+    /**
+     * Hydrate full table info (columns, type, comment) for a set of selected
+     * fully-qualified names. Used after the lightweight "show all" list so we
+     * only pay the per-table `tables.get` cost for tables the user actually
+     * selected.
+     */
+    app.post('/api/catalog/tables/hydrate', async (req: Request, res: Response) => {
+      try {
+        const body = req.body as { tables?: string[] };
+        const fqns = body.tables ?? [];
+        const ws = userWorkspaceClient(req);
+        const out: Array<Record<string, unknown>> = [];
+        for (const fqn of fqns) {
+          const parts = fqn.split('.');
+          const schemaName = parts.length === 3 ? parts[1] : '';
+          try {
+            const t = await ws.tables.get({ full_name: fqn });
+            const columns = (t.columns ?? []).map((col) => ({
+              name: col.name ?? '',
+              type: col.type_text ?? String(col.type_name ?? ''),
+              comment: col.comment ?? '',
+            }));
+            out.push({
+              name: t.name ?? parts[2] ?? fqn,
+              full_name: t.full_name ?? fqn,
+              schema_name: schemaName,
+              table_type: t.table_type ?? 'TABLE',
+              comment: t.comment ?? '',
+              columns,
+              column_count: columns.length,
+            });
+          } catch (e) {
+            out.push({
+              name: parts[2] ?? fqn,
+              full_name: fqn,
+              schema_name: schemaName,
+              table_type: 'TABLE',
+              comment: '',
+              columns: [],
+              column_count: 0,
+              error: String((e as Error).message ?? e),
+            });
+          }
         }
         res.json(out);
       } catch (err) {

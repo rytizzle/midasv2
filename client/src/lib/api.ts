@@ -33,6 +33,20 @@ export interface Table {
   comment: string;
   columns: Column[];
   column_count: number;
+  schema_name?: string;
+  owner_group?: string | null;
+  tier?: Tier;
+  tier_tagged?: boolean;
+}
+
+export type Tier = '0' | '1' | '2' | '3' | '4';
+
+export interface AllTablesPage {
+  tables: Table[];
+  total: number;
+  limit: number;
+  offset: number;
+  has_more: boolean;
 }
 
 export interface ColumnProfile {
@@ -62,6 +76,13 @@ export interface GenerationContext {
   docs: string;
   tableTemplate: string;
   columnTemplate: string;
+}
+
+/** Per-table tier override sent to generation (DAWG 0003). */
+export interface TierContext {
+  tier?: Tier;
+  tableTemplate?: string;
+  columnTemplate?: string;
 }
 
 async function getJSON<T>(path: string): Promise<T> {
@@ -126,6 +147,7 @@ export interface ProposalChange {
   current_value: string | null;
   proposed_value: string;
   decision: 'approved' | 'rejected' | null;
+  owner_group: string | null;
   apply_status: 'success' | 'error' | null;
   apply_error: string | null;
   applied_at: string | null;
@@ -139,6 +161,8 @@ export interface MeRole {
   email: string;
   name: string;
   is_admin: boolean;
+  groups?: string[];
+  can_approve?: boolean;
 }
 
 export const api = {
@@ -152,6 +176,20 @@ export const api = {
     getJSON<Table[]>(
       `/api/catalog/tables?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}`,
     ),
+  getAllTables: (
+    catalog: string,
+    warehouseId: string,
+    opts: { schema?: string; q?: string; limit?: number; offset?: number } = {},
+  ) => {
+    const p = new URLSearchParams({ catalog, warehouse_id: warehouseId });
+    if (opts.schema) p.set('schema', opts.schema);
+    if (opts.q) p.set('q', opts.q);
+    if (opts.limit != null) p.set('limit', String(opts.limit));
+    if (opts.offset != null) p.set('offset', String(opts.offset));
+    return getJSON<AllTablesPage>(`/api/catalog/all-tables?${p.toString()}`);
+  },
+  hydrateTables: (tables: string[]) =>
+    postJSON<Table[]>('/api/catalog/tables/hydrate', { tables }),
   getTags: (catalog: string, warehouseId: string) =>
     getJSON<TagMap>(
       `/api/catalog/tags?catalog=${encodeURIComponent(catalog)}&warehouse_id=${encodeURIComponent(warehouseId)}`,
@@ -167,10 +205,15 @@ export const api = {
       tables,
       warehouse_id: warehouseId,
     }),
-  generate: (tables: Record<string, TableProfile>, context: GenerationContext) =>
+  generate: (
+    tables: Record<string, TableProfile>,
+    context: GenerationContext,
+    tiers?: Record<string, TierContext>,
+  ) =>
     postJSON<Record<string, GeneratedMetadata>>('/api/metadata/generate', {
       tables,
       context,
+      tiers,
     }),
   apply: (
     changes: Record<string, { table_type?: string; table_comment?: string; columns?: Record<string, { description: string }> }>,

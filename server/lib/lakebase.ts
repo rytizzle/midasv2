@@ -163,6 +163,17 @@ async function ensureSchema(): Promise<void> {
     ALTER TABLE midas.change_proposals
       ADD COLUMN IF NOT EXISTS decision text;
   `);
+  // v3: owner group resolved from the table's owner governed tag at submit
+  // time. Approvals are gated on membership of this group. Null = untagged
+  // (falls back to workspace-admin approval).
+  await pool.query(`
+    ALTER TABLE midas.change_proposals
+      ADD COLUMN IF NOT EXISTS owner_group text;
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS change_proposals_owner_group_idx
+      ON midas.change_proposals(owner_group);
+  `);
   // Backfill so existing sessions surface meaningfully in the new UI.
   await pool.query(`
     UPDATE midas.change_proposals c

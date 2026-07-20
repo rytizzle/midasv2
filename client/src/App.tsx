@@ -38,8 +38,12 @@ import {
   type Table,
   type TableProfile,
   type TagMap,
+  type Tier,
+  type TierContext,
   type Warehouse,
 } from './lib/api';
+import { diffWords, hasChange } from './lib/diff';
+import { DEFAULT_TIER, tierSpec } from '@shared/tiers';
 
 const STEPS = ['Tables', 'Context', 'Profile & Generate', 'Review & Apply'] as const;
 
@@ -62,11 +66,14 @@ export default function App() {
   const [view, setView] = useState<AppView>('wizard');
   const [step, setStep] = useState(0);
   const [selectedTables, setSelectedTables] = useState<Table[]>([]);
+  // Templates start empty: by default each table uses its DAWG 0003 tier
+  // template (resolved server-side). Filling these overrides the tier template
+  // for every table in the batch.
   const [context, setContext] = useState({
     blurb: '',
     docs: '',
-    tableTemplate: DEFAULT_TABLE_TEMPLATE,
-    columnTemplate: DEFAULT_COLUMN_TEMPLATE,
+    tableTemplate: '',
+    columnTemplate: '',
   });
   const [profiles, setProfiles] = useState<Record<string, TableProfile> | null>(null);
   const [metadata, setMetadata] = useState<Record<string, GeneratedMetadata> | null>(null);
@@ -173,6 +180,7 @@ export default function App() {
         {view === 'wizard' && step === 2 && (
           <ProfileStep
             tables={selectedTables}
+            setTables={setSelectedTables}
             warehouseId={warehouseId}
             context={context}
             profiles={profiles}
@@ -201,6 +209,8 @@ export default function App() {
           <SessionsView
             userEmail={user?.email ?? ''}
             isAdmin={user?.is_admin ?? false}
+            canApprove={user?.can_approve ?? false}
+            userGroups={user?.groups ?? []}
             warehouseId={warehouseId}
           />
         )}
@@ -271,6 +281,155 @@ function WarehousePicker({
   );
 }
 
+function TierBadge({ tier, tagged }: { tier?: Tier; tagged?: boolean }) {
+  if (!tier) return null;
+  const spec = tierSpec(tier);
+  // Tier 0 (critical) gets the strongest visual weight.
+  const cls =
+    tier === '0'
+      ? 'bg-red-500/15 text-red-700 border-red-500/30'
+      : tier === '1'
+        ? 'bg-orange-500/15 text-orange-700 border-orange-500/30'
+        : tier === '2'
+          ? 'bg-amber-500/15 text-amber-700 border-amber-500/30'
+          : 'bg-muted text-muted-foreground border-transparent';
+  return (
+    <span
+      className={`text-[10px] px-1.5 py-0.5 rounded border ${cls}`}
+      title={
+        tagged
+          ? `${spec.label} (from governed tag)`
+          : `${spec.label} (default — no tier tag found)`
+      }
+    >
+      {spec.label}
+      {!tagged && tier === DEFAULT_TIER ? '?' : ''}
+    </span>
+  );
+}
+
+/**
+ * Pre-vs-post inline diff (feedback #2). Renders the current value and the
+ * proposed value with word-level add/remove highlighting so a reviewer (or the
+ * submitter) can verify exactly what will change before it's committed.
+ */
+function DiffView({
+  before,
+  after,
+  className = '',
+}: {
+  before: string | null | undefined;
+  after: string;
+  className?: string;
+}) {
+  const beforeText = before ?? '';
+  const changed = hasChange(beforeText, after);
+  const segments = diffWords(beforeText, after);
+
+  if (!beforeText) {
+    // No prior value — this is a brand-new comment.
+    return (
+      <div className={`rounded-md border overflow-hidden ${className}`}>
+        <div className="text-[10px] uppercase tracking-wide text-muted-foreground bg-muted/50 px-2 py-1">
+          New · no current value
+        </div>
+        <div className="text-sm whitespace-pre-wrap p-2 bg-green-500/5">{after}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className={`grid grid-cols-1 md:grid-cols-2 rounded-md border overflow-hidden ${className}`}>
+      <div className="border-b md:border-b-0 md:border-r">
+        <div className="text-[10px] uppercase tracking-wide text-muted-foreground bg-muted/50 px-2 py-1">
+          Current
+        </div>
+        <div className="text-sm whitespace-pre-wrap p-2 text-muted-foreground">{beforeText}</div>
+      </div>
+      <div>
+        <div className="text-[10px] uppercase tracking-wide text-muted-foreground bg-muted/50 px-2 py-1">
+          Proposed {changed ? '' : '· (unchanged)'}
+        </div>
+        <div className="text-sm whitespace-pre-wrap p-2 leading-relaxed">
+          {segments.map((seg, i) =>
+            seg.op === 'equal' ? (
+              <span key={i}>{seg.text}</span>
+            ) : seg.op === 'added' ? (
+              <span key={i} className="bg-green-500/20 text-green-800 rounded-sm">
+                {seg.text}
+              </span>
+            ) : (
+              <span key={i} className="bg-red-500/20 text-red-800 line-through rounded-sm">
+                {seg.text}
+              </span>
+            ),
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * DAWG 0003 requirements checklist for a table's tier (feedback #4). Shows the
+ * required/optional metadata fields for the tier and a soft indicator of which
+ * ones the generated metadata appears to cover. This is guidance — governed
+ * tags like Sensitivity_Type / Grain are set outside comment application, so
+ * unchecked items are informational, not blocking.
+ */
+function TierChecklist({ tier, meta }: { tier?: Tier; meta: GeneratedMetadata }) {
+  if (!tier) return null;
+  const spec = tierSpec(tier);
+  const hasTableComment = !!(meta.table_comment && meta.table_comment.trim());
+  const colCount = Object.values(meta.columns ?? {}).filter((c) => c?.description?.trim()).length;
+
+  // Which requirements can we infer from what this tool produces (comments)?
+  const inferred: Record<string, boolean> = {
+    description: hasTableComment,
+  };
+
+  const required = spec.fields.filter((f) => f.required);
+  return (
+    <div className="rounded-md border bg-muted/30 p-3 space-y-2">
+      <div className="flex items-center gap-2">
+        <TierBadge tier={tier} tagged />
+        <span className="text-xs font-medium">DAWG 0003 requirements</span>
+        {spec.columnDescriptionsRequired && (
+          <span className="text-[10px] text-muted-foreground">
+            · column descriptions required ({colCount} provided)
+          </span>
+        )}
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {required.map((f) => {
+          const known = f.key in inferred;
+          const ok = inferred[f.key];
+          return (
+            <span
+              key={f.key}
+              title={f.hint}
+              className={`text-[10px] px-1.5 py-0.5 rounded border ${
+                known
+                  ? ok
+                    ? 'bg-green-500/15 text-green-700 border-green-500/30'
+                    : 'bg-red-500/10 text-red-700 border-red-500/30'
+                  : 'bg-background text-muted-foreground border-border'
+              }`}
+            >
+              {known ? (ok ? '✓ ' : '· ') : '· '}
+              {f.label}
+            </span>
+          );
+        })}
+      </div>
+      <p className="text-[10px] text-muted-foreground">
+        Owner, Sensitivity_Type, Data_Tier, Grain and Lifecycle_Status are governed tags managed
+        outside comment application — listed here so you know what this tier requires.
+      </p>
+    </div>
+  );
+}
+
 function TableList({
   tables,
   selected,
@@ -283,9 +442,10 @@ function TableList({
   showSchema?: boolean;
 }) {
   return (
-    <div className="space-y-1 max-h-96 overflow-y-auto border rounded-md">
+    <div className="space-y-1 max-h-[28rem] overflow-y-auto border rounded-md">
       {tables.map((t) => {
         const checked = selected.some((s) => s.full_name === t.full_name);
+        const schemaName = t.schema_name;
         return (
           <div
             key={t.full_name}
@@ -306,12 +466,20 @@ function TableList({
               onClick={(e) => e.stopPropagation()}
             />
             <span className="font-mono">
-              {showSchema && (t as Table & { schema_name?: string }).schema_name
-                ? `${(t as Table & { schema_name?: string }).schema_name}.${t.name}`
-                : t.name}
+              {showSchema && schemaName ? `${schemaName}.${t.name}` : t.name}
             </span>
-            <span className="text-xs text-muted-foreground ml-auto">
-              {t.table_type} · {t.column_count} cols
+            <TierBadge tier={t.tier} tagged={t.tier_tagged} />
+            {t.owner_group && (
+              <span
+                className="text-[10px] text-muted-foreground truncate max-w-[140px]"
+                title={`Owner: ${t.owner_group}`}
+              >
+                {t.owner_group}
+              </span>
+            )}
+            <span className="text-xs text-muted-foreground ml-auto shrink-0">
+              {t.table_type}
+              {t.column_count ? ` · ${t.column_count} cols` : ''}
             </span>
           </div>
         );
@@ -320,48 +488,108 @@ function TableList({
   );
 }
 
+/**
+ * Default browse experience (feedback #1): "show all tables".
+ *
+ * Instead of forcing a catalog→schema drill-down before anything appears, this
+ * picks a catalog and immediately lists ALL tables across every schema, with a
+ * debounced server-side search box and paging. The heavy lifting (and the
+ * 39k-table performance guard) lives in /api/catalog/all-tables, which is
+ * bounded by LIMIT/OFFSET and never hydrates columns for the list. An optional
+ * schema filter narrows the view without changing the model.
+ */
 function BrowseMode({
+  warehouseId,
   selected,
   onToggle,
 }: {
+  warehouseId: string;
   selected: Table[];
   onToggle: (t: Table) => void;
 }) {
+  const PAGE = 200;
   const [catalogs, setCatalogs] = useState<string[] | null>(null);
   const [catalog, setCatalog] = useState<string | undefined>(undefined);
-  const [schemas, setSchemas] = useState<string[] | null>(null);
-  const [schema, setSchema] = useState<string | undefined>(undefined);
+  const [schemas, setSchemas] = useState<string[]>([]);
+  const [schema, setSchema] = useState<string>(''); // '' = all schemas
+  const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [tables, setTables] = useState<Table[] | null>(null);
+  const [total, setTotal] = useState(0);
+  const [offset, setOffset] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
 
   useEffect(() => {
-    api.getCatalogs().then((cs) => setCatalogs(cs.map((c) => c.name))).catch(() => setCatalogs([]));
+    api
+      .getCatalogs()
+      .then((cs) => {
+        const names = cs.map((c) => c.name);
+        setCatalogs(names);
+        // Auto-select the first catalog so tables show up with no extra click.
+        setCatalog((prev) => prev ?? names[0]);
+      })
+      .catch(() => setCatalogs([]));
   }, []);
 
+  // Load the schema list for the optional narrowing dropdown.
   useEffect(() => {
     if (!catalog) return;
-    setSchemas(null);
-    setSchema(undefined);
-    setTables(null);
-    api.getSchemas(catalog).then((ss) => setSchemas(ss.map((s) => s.name))).catch(() => setSchemas([]));
+    setSchema('');
+    api
+      .getSchemas(catalog)
+      .then((ss) => setSchemas(ss.map((s) => s.name)))
+      .catch(() => setSchemas([]));
   }, [catalog]);
 
+  // Debounce the search box.
   useEffect(() => {
-    if (!catalog || !schema) return;
+    const t = setTimeout(() => setDebouncedSearch(search), 300);
+    return () => clearTimeout(t);
+  }, [search]);
+
+  // Reset paging whenever the query shape changes.
+  useEffect(() => {
+    setOffset(0);
+  }, [catalog, schema, debouncedSearch]);
+
+  useEffect(() => {
+    if (!catalog || !warehouseId) return;
+    let cancelled = false;
     setLoading(true);
-    setTables(null);
+    setError('');
     api
-      .getTables(catalog, schema)
-      .then(setTables)
-      .catch(() => setTables([]))
-      .finally(() => setLoading(false));
-  }, [catalog, schema]);
+      .getAllTables(catalog, warehouseId, {
+        schema: schema || undefined,
+        q: debouncedSearch || undefined,
+        limit: PAGE,
+        offset,
+      })
+      .then((page) => {
+        if (cancelled) return;
+        setTables(page.tables);
+        setTotal(page.total);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setTables([]);
+        setTotal(0);
+        setError(String((e as Error).message ?? e));
+      })
+      .finally(() => !cancelled && setLoading(false));
+    return () => {
+      cancelled = true;
+    };
+  }, [catalog, schema, debouncedSearch, offset, warehouseId]);
+
+  const from = total === 0 ? 0 : offset + 1;
+  const to = offset + (tables?.length ?? 0);
 
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-2 gap-4">
-        <div className="space-y-2">
-          <Label>Catalog</Label>
+      <div className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_2fr] gap-3">
+        <div className="space-y-1">
+          <Label className="text-xs">Catalog</Label>
           {catalogs == null ? (
             <Skeleton className="h-9 w-full" />
           ) : (
@@ -379,39 +607,85 @@ function BrowseMode({
             </Select>
           )}
         </div>
-        <div className="space-y-2">
-          <Label>Schema</Label>
-          {!catalog ? (
-            <Input disabled placeholder="Pick a catalog first" />
-          ) : schemas == null ? (
-            <Skeleton className="h-9 w-full" />
-          ) : (
-            <Select value={schema} onValueChange={setSchema}>
-              <SelectTrigger>
-                <SelectValue placeholder="Choose schema" />
-              </SelectTrigger>
-              <SelectContent>
-                {schemas.map((s) => (
-                  <SelectItem key={s} value={s}>
-                    {s}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          )}
+        <div className="space-y-1">
+          <Label className="text-xs">Schema (optional)</Label>
+          <Select value={schema || '__all__'} onValueChange={(v) => setSchema(v === '__all__' ? '' : v)}>
+            <SelectTrigger>
+              <SelectValue placeholder="All schemas" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__all__">All schemas</SelectItem>
+              {schemas.map((s) => (
+                <SelectItem key={s} value={s}>
+                  {s}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="space-y-1">
+          <Label className="text-xs">Search tables</Label>
+          <Input
+            placeholder="Filter by table or schema name…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
         </div>
       </div>
 
       <Separator />
 
-      {loading && <Spinner />}
-      {tables && tables.length === 0 && (
-        <p className="text-sm text-muted-foreground">
-          No tables found in {catalog}.{schema}
-        </p>
+      {!warehouseId && (
+        <p className="text-sm text-muted-foreground">Pick a warehouse to browse tables.</p>
       )}
-      {tables && tables.length > 0 && (
-        <TableList tables={tables} selected={selected} onToggle={onToggle} />
+      {error && (
+        <div className="text-sm text-destructive bg-destructive/10 p-3 rounded-md">{error}</div>
+      )}
+
+      {catalog && warehouseId && (
+        <>
+          <div className="flex items-center justify-between text-xs text-muted-foreground">
+            <span>
+              {loading ? (
+                'Loading…'
+              ) : total > 0 ? (
+                <>
+                  Showing <span className="font-medium text-foreground">{from}</span>–
+                  <span className="font-medium text-foreground">{to}</span> of{' '}
+                  <span className="font-medium text-foreground">{total.toLocaleString()}</span>{' '}
+                  table{total === 1 ? '' : 's'}
+                  {debouncedSearch ? ` matching “${debouncedSearch}”` : ''}
+                </>
+              ) : (
+                'No tables found.'
+              )}
+            </span>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={offset === 0 || loading}
+                onClick={() => setOffset(Math.max(0, offset - PAGE))}
+              >
+                ← Prev
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={to >= total || loading}
+                onClick={() => setOffset(offset + PAGE)}
+              >
+                Next →
+              </Button>
+            </div>
+          </div>
+
+          {loading && !tables ? (
+            <Skeleton className="h-64 w-full" />
+          ) : tables && tables.length > 0 ? (
+            <TableList tables={tables} selected={selected} onToggle={onToggle} showSchema />
+          ) : null}
+        </>
       )}
     </div>
   );
@@ -637,7 +911,7 @@ function TablesStep({
             <TabsTrigger value="tags">Tag filter</TabsTrigger>
           </TabsList>
           <TabsContent value="browse" className="pt-4">
-            <BrowseMode selected={selected} onToggle={toggle} />
+            <BrowseMode warehouseId={warehouseId} selected={selected} onToggle={toggle} />
           </TabsContent>
           <TabsContent value="tags" className="pt-4">
             <TagFilterMode warehouseId={warehouseId} selected={selected} onToggle={toggle} />
@@ -673,7 +947,8 @@ function ContextStep({
       <CardHeader>
         <CardTitle>Add context</CardTitle>
         <CardDescription>
-          Tell the model what this data is about. Templates control output structure.
+          Tell the model what this data is about. By default each table uses the DAWG 0003 template
+          for its tier; the templates below override that for every table when set.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -692,16 +967,68 @@ function ContextStep({
             <TabsTrigger value="column">Column template</TabsTrigger>
           </TabsList>
           <TabsContent value="table" className="space-y-2">
+            <div className="flex items-center justify-between">
+              <p className="text-[11px] text-muted-foreground">
+                Leave blank to use each table's DAWG 0003 tier template.
+              </p>
+              <div className="flex gap-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-xs h-7"
+                  onClick={() => onChange({ ...context, tableTemplate: DEFAULT_TABLE_TEMPLATE })}
+                >
+                  Load standard default
+                </Button>
+                {context.tableTemplate && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-xs h-7"
+                    onClick={() => onChange({ ...context, tableTemplate: '' })}
+                  >
+                    Clear
+                  </Button>
+                )}
+              </div>
+            </div>
             <Textarea
               value={context.tableTemplate}
+              placeholder={`Per-tier template used by default. Example (standard tiers):\n${DEFAULT_TABLE_TEMPLATE}`}
               onChange={(e) => onChange({ ...context, tableTemplate: e.target.value })}
               rows={8}
               className="font-mono text-xs"
             />
           </TabsContent>
           <TabsContent value="column" className="space-y-2">
+            <div className="flex items-center justify-between">
+              <p className="text-[11px] text-muted-foreground">
+                Leave blank to use each table's DAWG 0003 tier template.
+              </p>
+              <div className="flex gap-1">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-xs h-7"
+                  onClick={() => onChange({ ...context, columnTemplate: DEFAULT_COLUMN_TEMPLATE })}
+                >
+                  Load standard default
+                </Button>
+                {context.columnTemplate && (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="text-xs h-7"
+                    onClick={() => onChange({ ...context, columnTemplate: '' })}
+                  >
+                    Clear
+                  </Button>
+                )}
+              </div>
+            </div>
             <Textarea
               value={context.columnTemplate}
+              placeholder={`Per-tier template used by default. Example:\n${DEFAULT_COLUMN_TEMPLATE}`}
               onChange={(e) => onChange({ ...context, columnTemplate: e.target.value })}
               rows={4}
               className="font-mono text-xs"
@@ -722,6 +1049,7 @@ function ContextStep({
 
 function ProfileStep({
   tables,
+  setTables,
   warehouseId,
   context,
   profiles,
@@ -732,6 +1060,7 @@ function ProfileStep({
   onNext,
 }: {
   tables: Table[];
+  setTables: (t: Table[]) => void;
   warehouseId: string;
   context: { blurb: string; docs: string; tableTemplate: string; columnTemplate: string };
   profiles: Record<string, TableProfile> | null;
@@ -741,22 +1070,45 @@ function ProfileStep({
   onBack: () => void;
   onNext: () => void;
 }) {
-  const [status, setStatus] = useState<'idle' | 'profiling' | 'generating' | 'done' | 'error'>(
+  const [status, setStatus] = useState<'idle' | 'hydrating' | 'profiling' | 'generating' | 'done' | 'error'>(
     'idle',
   );
   const [error, setError] = useState<string>('');
 
   const run = async () => {
     setError('');
-    setStatus('profiling');
     setProfiles(null);
     setMetadata(null);
     try {
-      const fqns = tables.map((t) => t.full_name);
+      // Tables picked from the lightweight "show all" list have no columns
+      // hydrated yet — fetch them now so profiling + the pre/post diff have the
+      // current comments to compare against.
+      let working = tables;
+      const needHydrate = tables.filter((t) => t.column_count === 0 || t.columns.length === 0);
+      if (needHydrate.length > 0) {
+        setStatus('hydrating');
+        const hydrated = await api.hydrateTables(needHydrate.map((t) => t.full_name));
+        const byFqn = new Map(hydrated.map((h) => [h.full_name, h]));
+        working = tables.map((t) => {
+          const h = byFqn.get(t.full_name);
+          return h ? { ...t, ...h, tier: t.tier, owner_group: t.owner_group } : t;
+        });
+        setTables(working);
+      }
+
+      setStatus('profiling');
+      const fqns = working.map((t) => t.full_name);
       const p = await api.profile(fqns, warehouseId);
       setProfiles(p);
+
       setStatus('generating');
-      const m = await api.generate(p, context);
+      // Per-table tier context (DAWG 0003): drive the template off each table's
+      // tier so critical Tier 0 tables get the richer prompt.
+      const tiers: Record<string, TierContext> = {};
+      for (const t of working) {
+        if (t.tier) tiers[t.full_name] = { tier: t.tier };
+      }
+      const m = await api.generate(p, context, tiers);
       setMetadata(m);
       setStatus('done');
     } catch (e) {
@@ -783,9 +1135,14 @@ function ProfileStep({
             Start
           </Button>
         )}
-        {(status === 'profiling' || status === 'generating') && (
+        {(status === 'hydrating' || status === 'profiling' || status === 'generating') && (
           <div className="flex items-center gap-3 text-sm">
-            <Spinner /> {status === 'profiling' ? 'Profiling tables…' : 'Generating metadata…'}
+            <Spinner />{' '}
+            {status === 'hydrating'
+              ? 'Loading table details…'
+              : status === 'profiling'
+                ? 'Profiling tables…'
+                : 'Generating metadata…'}
           </div>
         )}
         {status === 'error' && (
@@ -924,6 +1281,8 @@ function ReviewStep({
   const allKeys = tables.map((t) => t.full_name);
   const [openItems, setOpenItems] = useState<string[]>(allKeys);
   const allOpen = openItems.length === allKeys.length;
+  // Per-table view mode: 'edit' (textareas) or 'diff' (pre-vs-post preview).
+  const [viewMode, setViewMode] = useState<'edit' | 'diff'>('diff');
 
   return (
     <div className="space-y-4">
@@ -932,9 +1291,35 @@ function ReviewStep({
           <div className="flex items-center justify-between gap-3">
             <div>
               <CardTitle>Review generated metadata</CardTitle>
-              <CardDescription>Edit any descriptions before applying.</CardDescription>
+              <CardDescription>
+                Verify the pre-vs-post diff, then edit if needed before submitting.
+              </CardDescription>
             </div>
             <div className="flex gap-2">
+              <div className="flex rounded-md border overflow-hidden text-xs">
+                <button
+                  type="button"
+                  onClick={() => setViewMode('diff')}
+                  className={`px-3 py-1.5 transition-colors ${
+                    viewMode === 'diff'
+                      ? 'bg-primary text-primary-foreground'
+                      : 'text-muted-foreground hover:bg-muted'
+                  }`}
+                >
+                  Diff
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode('edit')}
+                  className={`px-3 py-1.5 transition-colors ${
+                    viewMode === 'edit'
+                      ? 'bg-primary text-primary-foreground'
+                      : 'text-muted-foreground hover:bg-muted'
+                  }`}
+                >
+                  Edit
+                </button>
+              </div>
               <Button
                 variant="outline"
                 size="sm"
@@ -954,6 +1339,7 @@ function ReviewStep({
               const summary = m.error
                 ? `error: ${m.error.slice(0, 60)}`
                 : `${columnEntries.length} column${columnEntries.length === 1 ? '' : 's'}`;
+              const colByName = new Map(t.columns.map((c) => [c.name, c]));
               return (
                 <AccordionItem
                   key={t.full_name}
@@ -963,6 +1349,7 @@ function ReviewStep({
                   <AccordionTrigger className="hover:no-underline py-3">
                     <div className="flex items-center gap-3 flex-1 min-w-0 text-left">
                       <span className="font-mono text-sm font-semibold truncate">{t.full_name}</span>
+                      <TierBadge tier={t.tier} tagged={t.tier_tagged} />
                       <Badge variant={m.error ? 'destructive' : 'secondary'} className="text-xs shrink-0">
                         {summary}
                       </Badge>
@@ -973,31 +1360,46 @@ function ReviewStep({
                       <div className="text-sm text-destructive">{m.error}</div>
                     ) : (
                       <div className="space-y-3">
+                        <TierChecklist tier={t.tier} meta={m} />
                         <div className="space-y-1">
                           <Label className="text-xs">Table comment</Label>
-                          <Textarea
-                            value={m.table_comment ?? ''}
-                            onChange={(e) => updateTableComment(t.full_name, e.target.value)}
-                            rows={3}
-                            className="text-sm"
-                          />
+                          {viewMode === 'edit' ? (
+                            <Textarea
+                              value={m.table_comment ?? ''}
+                              onChange={(e) => updateTableComment(t.full_name, e.target.value)}
+                              rows={3}
+                              className="text-sm"
+                            />
+                          ) : (
+                            <DiffView before={t.comment} after={m.table_comment ?? ''} />
+                          )}
                         </div>
                         <div className="space-y-2">
                           <Label className="text-xs">Column descriptions</Label>
                           <div className="space-y-2">
-                            {columnEntries.map(([col, val]) => (
-                              <div key={col} className="grid grid-cols-[200px_1fr] gap-2 items-start">
-                                <code className="text-xs pt-2 truncate">{col}</code>
-                                <Textarea
-                                  value={val.description}
-                                  onChange={(e) =>
-                                    updateColumnDescription(t.full_name, col, e.target.value)
-                                  }
-                                  rows={2}
-                                  className="text-xs"
-                                />
-                              </div>
-                            ))}
+                            {columnEntries.map(([col, val]) =>
+                              viewMode === 'edit' ? (
+                                <div key={col} className="grid grid-cols-[200px_1fr] gap-2 items-start">
+                                  <code className="text-xs pt-2 truncate">{col}</code>
+                                  <Textarea
+                                    value={val.description}
+                                    onChange={(e) =>
+                                      updateColumnDescription(t.full_name, col, e.target.value)
+                                    }
+                                    rows={2}
+                                    className="text-xs"
+                                  />
+                                </div>
+                              ) : (
+                                <div key={col} className="space-y-1">
+                                  <code className="text-xs truncate">{col}</code>
+                                  <DiffView
+                                    before={colByName.get(col)?.comment ?? ''}
+                                    after={val.description}
+                                  />
+                                </div>
+                              ),
+                            )}
                           </div>
                         </div>
                       </div>
@@ -1014,9 +1416,10 @@ function ReviewStep({
         <CardHeader>
           <CardTitle>Submit for approval</CardTitle>
           <CardDescription>
-            Proposed changes are written to Lakebase and queued for review.
-            On approval, an admin runs <code>COMMENT ON TABLE</code> /{' '}
-            <code>ALTER COLUMN COMMENT</code> via your warehouse to apply them.
+            Proposed changes are written to Lakebase and queued for review by the owning group.
+            On approval, an approver from each table's owner group runs{' '}
+            <code>COMMENT ON TABLE</code> / <code>ALTER COLUMN COMMENT</code> via your warehouse to
+            apply them.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -1089,16 +1492,21 @@ function timeAgo(iso: string | null | undefined): string {
 function SessionsView({
   userEmail,
   isAdmin,
+  canApprove,
+  userGroups,
   warehouseId,
 }: {
   userEmail: string;
   isAdmin: boolean;
+  canApprove: boolean;
+  userGroups: string[];
   warehouseId: string;
 }) {
   type Scope = 'mine' | 'pending';
-  // Non-admins only ever see their own — scope is locked to 'mine'.
-  // Admins default to the 'pending' (review queue) tab.
-  const [scope, setScope] = useState<Scope>(isAdmin ? 'pending' : 'mine');
+  // Approvers (workspace admins, override-group members, or members of any
+  // owner group) default to the 'pending' review queue. Everyone else is
+  // locked to their own submissions.
+  const [scope, setScope] = useState<Scope>(canApprove ? 'pending' : 'mine');
   const [sessions, setSessions] = useState<SessionSummary[] | null>(null);
   const [error, setError] = useState<string>('');
   const [activeId, setActiveId] = useState<string | null>(null);
@@ -1118,9 +1526,9 @@ function SessionsView({
   useEffect(() => {
     refresh();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scope, isAdmin]);
+  }, [scope, canApprove]);
 
-  const scopeOptions: Scope[] = isAdmin ? ['pending', 'mine'] : ['mine'];
+  const scopeOptions: Scope[] = canApprove ? ['pending', 'mine'] : ['mine'];
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-[360px_1fr] gap-4">
@@ -1150,9 +1558,17 @@ function SessionsView({
               ))}
             </div>
           )}
-          {!isAdmin && (
+          {canApprove ? (
             <p className="text-[11px] text-muted-foreground pt-1">
-              You see only submissions you created. Workspace admins review pending submissions.
+              {isAdmin
+                ? 'As a workspace admin you can review every submission.'
+                : `You can approve changes owned by your groups: ${
+                    userGroups.length ? userGroups.join(', ') : '(none)'
+                  }.`}
+            </p>
+          ) : (
+            <p className="text-[11px] text-muted-foreground pt-1">
+              You see only submissions you created. Owner-group members review pending submissions.
             </p>
           )}
         </CardHeader>
@@ -1204,6 +1620,7 @@ function SessionsView({
             sessionId={activeId}
             userEmail={userEmail}
             isAdmin={isAdmin}
+            userGroups={userGroups}
             warehouseId={warehouseId}
             onChanged={refresh}
           />
@@ -1223,12 +1640,14 @@ function SessionDetailCard({
   sessionId,
   userEmail,
   isAdmin,
+  userGroups,
   warehouseId,
   onChanged,
 }: {
   sessionId: string;
   userEmail: string;
   isAdmin: boolean;
+  userGroups: string[];
   warehouseId: string;
   onChanged: () => void;
 }) {
@@ -1237,8 +1656,19 @@ function SessionDetailCard({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>('');
   // Selection state for per-change approve/reject. Defaults to all undecided
-  // selected so an admin can "Approve selected" with one click on a fresh session.
+  // changes the caller is allowed to decide, so a one-click "Approve selected"
+  // never includes changes they lack authority over.
   const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  const groupSet = new Set(userGroups.map((g) => g.toLowerCase()));
+  // Can the current user decide a given change? Admins can decide anything;
+  // others only changes owned by a group they belong to. (The server enforces
+  // this too — this just keeps the UI honest.)
+  const mayDecide = (ownerGroup: string | null): boolean => {
+    if (isAdmin) return true;
+    if (!ownerGroup) return false;
+    return groupSet.has(ownerGroup.toLowerCase());
+  };
 
   const load = async () => {
     setError('');
@@ -1246,7 +1676,13 @@ function SessionDetailCard({
       const d = await api.getSession(sessionId);
       setDetail(d);
       setReviewComment(d.review_comment ?? '');
-      setSelected(new Set(d.changes.filter((c) => !c.decision).map((c) => c.change_id)));
+      setSelected(
+        new Set(
+          d.changes
+            .filter((c) => !c.decision && mayDecide(c.owner_group))
+            .map((c) => c.change_id),
+        ),
+      );
     } catch (e) {
       setError(String((e as Error).message ?? e));
     }
@@ -1272,13 +1708,19 @@ function SessionDetailCard({
   }
 
   const isOwn = detail.submitted_by === userEmail;
-  const canDecide = detail.status === 'pending' && isAdmin;
-  const canResubmit = detail.status === 'rejected' && isOwn;
   const undecidedChanges = detail.changes.filter((c) => !c.decision);
-  const selectedUndecided = undecidedChanges.filter((c) => selected.has(c.change_id));
+  // Changes this user is actually allowed to decide (owner-group gated).
+  const decidableChanges = undecidedChanges.filter((c) => mayDecide(c.owner_group));
+  // Show the decision controls whenever the session is pending and the user can
+  // act on at least one change in it.
+  const canDecide = detail.status === 'pending' && decidableChanges.length > 0;
+  const canResubmit = detail.status === 'rejected' && isOwn;
+  const selectedUndecided = decidableChanges.filter((c) => selected.has(c.change_id));
   const approvedCount = detail.changes.filter((c) => c.decision === 'approved').length;
   const rejectedCount = detail.changes.filter((c) => c.decision === 'rejected').length;
   const errorCount = detail.changes.filter((c) => c.apply_status === 'error').length;
+  // Undecided changes the user cannot act on (owned by other groups).
+  const lockedChanges = undecidedChanges.filter((c) => !mayDecide(c.owner_group));
 
   const toggleSelected = (id: string) =>
     setSelected((prev) => {
@@ -1287,7 +1729,7 @@ function SessionDetailCard({
       else next.add(id);
       return next;
     });
-  const selectAll = () => setSelected(new Set(undecidedChanges.map((c) => c.change_id)));
+  const selectAll = () => setSelected(new Set(decidableChanges.map((c) => c.change_id)));
   const selectNone = () => setSelected(new Set());
 
   const groupedByTable = new Map<string, ProposalChange[]>();
@@ -1341,7 +1783,15 @@ function SessionDetailCard({
               <span className="font-medium text-foreground">
                 {selectedUndecided.length}
               </span>{' '}
-              of {undecidedChanges.length} undecided selected
+              of {decidableChanges.length} decidable selected
+              {lockedChanges.length > 0 && (
+                <>
+                  {' · '}
+                  <span title="Owned by groups you're not a member of">
+                    {lockedChanges.length} locked to other groups
+                  </span>
+                </>
+              )}
               {(approvedCount > 0 || rejectedCount > 0) && (
                 <>
                   {' · '}
@@ -1383,6 +1833,8 @@ function SessionDetailCard({
             const tableApproved = changes.filter((c) => c.decision === 'approved').length;
             const tableRejected = changes.filter((c) => c.decision === 'rejected').length;
             const tableErrors = changes.filter((c) => c.apply_status === 'error').length;
+            const ownerGroup = changes.find((c) => c.owner_group)?.owner_group ?? null;
+            const locked = changes.some((c) => !c.decision && !mayDecide(c.owner_group));
             return (
               <AccordionItem key={fqn} value={fqn} className="border rounded-md px-4">
                 <AccordionTrigger className="hover:no-underline py-3">
@@ -1391,6 +1843,18 @@ function SessionDetailCard({
                     <Badge variant="secondary" className="text-[10px] shrink-0">
                       {changes.length} change{changes.length === 1 ? '' : 's'}
                     </Badge>
+                    <Badge
+                      variant="secondary"
+                      className="text-[10px] shrink-0"
+                      title={ownerGroup ? `Owner group: ${ownerGroup}` : 'No owner tag — admin-approved'}
+                    >
+                      {ownerGroup ? `owner: ${ownerGroup}` : 'no owner tag'}
+                    </Badge>
+                    {locked && (
+                      <Badge variant="secondary" className="text-[10px] shrink-0" title="You are not a member of this owner group">
+                        🔒 other group
+                      </Badge>
+                    )}
                     {tableApproved > 0 && (
                       <Badge variant="secondary" className="text-[10px] shrink-0 text-green-700">
                         {tableApproved} approved
@@ -1414,7 +1878,11 @@ function SessionDetailCard({
                       label="Table comment"
                       change={tableComment}
                       editable={canResubmit && !tableComment.decision}
-                      selectable={canDecide && !tableComment.decision}
+                      selectable={
+                        detail.status === 'pending' &&
+                        mayDecide(tableComment.owner_group) &&
+                        !tableComment.decision
+                      }
                       selected={selected.has(tableComment.change_id)}
                       onToggleSelect={() => toggleSelected(tableComment.change_id)}
                       sessionId={detail.session_id}
@@ -1427,7 +1895,9 @@ function SessionDetailCard({
                       label={`Column · ${c.column_name}`}
                       change={c}
                       editable={canResubmit && !c.decision}
-                      selectable={canDecide && !c.decision}
+                      selectable={
+                        detail.status === 'pending' && mayDecide(c.owner_group) && !c.decision
+                      }
                       selected={selected.has(c.change_id)}
                       onToggleSelect={() => toggleSelected(c.change_id)}
                       sessionId={detail.session_id}
@@ -1585,18 +2055,10 @@ function ChangeDiff({
           </Badge>
         )}
       </div>
-      {change.current_value && (
-        <details className="text-xs">
-          <summary className="cursor-pointer text-muted-foreground">
-            Current value
-          </summary>
-          <pre className="whitespace-pre-wrap bg-muted/40 p-2 rounded mt-1 text-[11px]">
-            {change.current_value}
-          </pre>
-        </details>
-      )}
       {editable ? (
         <>
+          {/* Show the pre/post diff for reference while editing the proposal. */}
+          <DiffView before={change.current_value} after={change.proposed_value} className="mb-2" />
           <Textarea
             value={val}
             onChange={(e) => setVal(e.target.value)}
@@ -1611,9 +2073,7 @@ function ChangeDiff({
           )}
         </>
       ) : (
-        <div className="text-sm whitespace-pre-wrap bg-background border rounded-md p-2">
-          {change.proposed_value}
-        </div>
+        <DiffView before={change.current_value} after={change.proposed_value} />
       )}
       {change.apply_error && (
         <div className="text-xs text-destructive">{change.apply_error}</div>

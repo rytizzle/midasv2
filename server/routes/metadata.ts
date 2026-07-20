@@ -1,5 +1,11 @@
 import type { Application, Request, Response } from 'express';
-import { buildPrompt, stripCodeFences, type GenerationContext, type TableProfile } from '../lib/prompt';
+import {
+  buildPrompt,
+  stripCodeFences,
+  type GenerationContext,
+  type TableProfile,
+  type TierContext,
+} from '../lib/prompt';
 
 interface AppKit {
   server: { extend(fn: (app: Application) => void): void };
@@ -8,6 +14,8 @@ interface AppKit {
 interface GenerateRequest {
   tables?: Record<string, TableProfile>;
   context?: GenerationContext;
+  /** Optional per-table tier overrides (fqn → tier context), DAWG 0003. */
+  tiers?: Record<string, TierContext>;
 }
 
 interface ColumnMeta {
@@ -54,8 +62,9 @@ async function generateForTable(
   tableName: string,
   profile: TableProfile,
   ctx: GenerationContext,
+  tierCtx?: TierContext,
 ): Promise<TableMeta> {
-  const prompt = buildPrompt(tableName, profile, ctx);
+  const prompt = buildPrompt(tableName, profile, ctx, tierCtx);
   const resp = await callServing(req, {
     messages: [{ role: 'user', content: prompt }],
     max_tokens: 4096,
@@ -80,10 +89,11 @@ export function registerMetadataRoutes(appkit: AppKit) {
         const body = req.body as GenerateRequest;
         const tables = body.tables ?? {};
         const ctx = body.context ?? {};
+        const tiers = body.tiers ?? {};
         const results: Record<string, TableMeta | { error: string }> = {};
         for (const [fqn, profile] of Object.entries(tables)) {
           try {
-            results[fqn] = await generateForTable(req, fqn, profile, ctx);
+            results[fqn] = await generateForTable(req, fqn, profile, ctx, tiers[fqn]);
           } catch (e) {
             results[fqn] = { error: String((e as Error).message ?? e) };
           }

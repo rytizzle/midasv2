@@ -69,6 +69,30 @@ interface WizardContext {
   tierTemplates: TierTemplates;
 }
 
+/**
+ * Stable signature of the inputs that feed generation: the selected tables
+ * (with their tier, since tier drives the template) plus the shared blurb/docs
+ * and only the tier templates actually in use. Comparing this to the signature
+ * captured at generation time tells us whether the cached metadata is stale.
+ */
+function generationSignature(tables: Table[], context: WizardContext): string {
+  const tiersInUse = new Set(tables.map((t) => t.tier ?? DEFAULT_TIER));
+  const fqns = tables
+    .map((t) => `${t.full_name}@${t.tier ?? DEFAULT_TIER}`)
+    .sort();
+  const templates = TIER_ORDER.filter((t) => tiersInUse.has(t)).map((t) => [
+    t,
+    context.tierTemplates[t].tableTemplate,
+    context.tierTemplates[t].columnTemplate,
+  ]);
+  return JSON.stringify({
+    fqns,
+    blurb: context.blurb,
+    docs: context.docs,
+    templates,
+  });
+}
+
 type AppView = 'wizard' | 'sessions';
 
 export default function App() {
@@ -91,6 +115,10 @@ export default function App() {
   });
   const [profiles, setProfiles] = useState<Record<string, TableProfile> | null>(null);
   const [metadata, setMetadata] = useState<Record<string, GeneratedMetadata> | null>(null);
+  // Signature of the inputs (selected tables + context) captured the last time
+  // metadata was generated. Lets the Profile & Generate step show its "done"
+  // state on return and warn when the selection/context has since changed.
+  const [genSignature, setGenSignature] = useState<string | null>(null);
 
   useEffect(() => {
     api
@@ -130,6 +158,7 @@ export default function App() {
     setSelectedTables([]);
     setProfiles(null);
     setMetadata(null);
+    setGenSignature(null);
   };
 
   // Tiers present in the current selection, so the Context step can surface the
@@ -216,6 +245,9 @@ export default function App() {
             metadata={metadata}
             setProfiles={setProfiles}
             setMetadata={setMetadata}
+            genSignature={genSignature}
+            setGenSignature={setGenSignature}
+            currentSignature={generationSignature(selectedTables, context)}
             onBack={() => setStep(1)}
             onNext={() => goToStep(3)}
           />
@@ -1176,6 +1208,9 @@ function ProfileStep({
   metadata,
   setProfiles,
   setMetadata,
+  genSignature,
+  setGenSignature,
+  currentSignature,
   onBack,
   onNext,
 }: {
@@ -1187,13 +1222,25 @@ function ProfileStep({
   metadata: Record<string, GeneratedMetadata> | null;
   setProfiles: (p: Record<string, TableProfile> | null) => void;
   setMetadata: (m: Record<string, GeneratedMetadata> | null) => void;
+  genSignature: string | null;
+  setGenSignature: (s: string | null) => void;
+  currentSignature: string;
   onBack: () => void;
   onNext: () => void;
 }) {
-  const [status, setStatus] = useState<'idle' | 'hydrating' | 'profiling' | 'generating' | 'done' | 'error'>(
-    'idle',
-  );
+  // Results already exist (we navigated back into this step) → land on the
+  // "done" summary instead of re-prompting for a run.
+  const hasResults = metadata != null && Object.keys(metadata).length > 0;
+  const [status, setStatus] = useState<
+    'idle' | 'hydrating' | 'profiling' | 'generating' | 'done' | 'error'
+  >(hasResults ? 'done' : 'idle');
   const [error, setError] = useState<string>('');
+
+  // The cached metadata was generated for a different table selection / context
+  // than what's currently configured — flag it so the user can refresh rather
+  // than silently submit stale descriptions.
+  const stale = hasResults && genSignature != null && genSignature !== currentSignature;
+  const busy = status === 'hydrating' || status === 'profiling' || status === 'generating';
 
   const run = async () => {
     setError('');
@@ -1240,6 +1287,8 @@ function ProfileStep({
       // templates travel in `tiers`.
       const m = await api.generate(p, { blurb: context.blurb, docs: context.docs }, tiers);
       setMetadata(m);
+      // Stamp what these results were generated from, for staleness detection.
+      setGenSignature(currentSignature);
       setStatus('done');
     } catch (e) {
       setError(String((e as Error).message ?? e));
@@ -1260,12 +1309,12 @@ function ProfileStep({
           {tables.length} table{tables.length === 1 ? '' : 's'} queued.
         </div>
 
-        {status === 'idle' && (
+        {(status === 'idle' || status === 'error') && (
           <Button onClick={run} disabled={!warehouseId}>
             Start
           </Button>
         )}
-        {(status === 'hydrating' || status === 'profiling' || status === 'generating') && (
+        {busy && (
           <div className="flex items-center gap-3 text-sm">
             <Spinner />{' '}
             {status === 'hydrating'
@@ -1281,8 +1330,26 @@ function ProfileStep({
           </div>
         )}
         {status === 'done' && (
-          <div className="space-y-2">
-            <p className="text-sm text-green-600">Done. {Object.keys(metadata ?? {}).length} tables generated.</p>
+          <div className="space-y-3">
+            {stale ? (
+              <div className="flex flex-wrap items-center gap-3 text-sm bg-amber-500/10 text-amber-700 border border-amber-500/30 p-3 rounded-md">
+                <span>
+                  Your table selection or context changed since this was generated. Re-run to refresh, or continue with the existing results.
+                </span>
+                <Button size="sm" onClick={run} disabled={!warehouseId}>
+                  Re-run
+                </Button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-3">
+                <p className="text-sm text-green-600">
+                  Done. {Object.keys(metadata ?? {}).length} tables generated.
+                </p>
+                <Button variant="outline" size="sm" onClick={run} disabled={!warehouseId}>
+                  Re-run
+                </Button>
+              </div>
+            )}
             {profiles && (
               <div className="text-xs text-muted-foreground">
                 {Object.entries(profiles).map(([fqn, p]) => (
@@ -1300,7 +1367,7 @@ function ProfileStep({
           <Button variant="outline" onClick={onBack}>
             ← Back
           </Button>
-          <Button onClick={onNext} disabled={status !== 'done'}>
+          <Button onClick={onNext} disabled={!hasResults || busy}>
             Next: Review & Apply →
           </Button>
         </div>

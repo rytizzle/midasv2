@@ -77,6 +77,10 @@ export default function App() {
   const [warehouseId, setWarehouseId] = useState<string>('');
   const [view, setView] = useState<AppView>('wizard');
   const [step, setStep] = useState(0);
+  // Furthest step the user has reached, so the stepper lets them jump back to
+  // an earlier step and then forward again without losing navigation (their
+  // work already lives in the state below). Reset by resetWizard.
+  const [maxStep, setMaxStep] = useState(0);
   const [selectedTables, setSelectedTables] = useState<Table[]>([]);
   // Per-tier templates seed from the DAWG 0003 specs and are editable in the
   // Context step; each table uses the template for its tier.
@@ -113,8 +117,16 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
+  // Navigate to a step and remember the furthest reached, so backward then
+  // forward navigation via the stepper stays enabled.
+  const goToStep = (s: number) => {
+    setStep(s);
+    setMaxStep((m) => Math.max(m, s));
+  };
+
   const resetWizard = () => {
     setStep(0);
+    setMaxStep(0);
     setSelectedTables([]);
     setProfiles(null);
     setMetadata(null);
@@ -174,7 +186,7 @@ export default function App() {
         </div>
       </header>
 
-      {view === 'wizard' && <Stepper step={step} setStep={setStep} />}
+      {view === 'wizard' && <Stepper step={step} maxStep={maxStep} setStep={setStep} />}
 
       <main className="max-w-6xl mx-auto px-6 py-6">
         {view === 'wizard' && step === 0 && (
@@ -182,7 +194,7 @@ export default function App() {
             warehouseId={warehouseId}
             selected={selectedTables}
             onChange={setSelectedTables}
-            onNext={() => setStep(1)}
+            onNext={() => goToStep(1)}
           />
         )}
         {view === 'wizard' && step === 1 && (
@@ -191,7 +203,7 @@ export default function App() {
             onChange={setContext}
             tiersInUse={tiersInUse}
             onBack={() => setStep(0)}
-            onNext={() => setStep(2)}
+            onNext={() => goToStep(2)}
           />
         )}
         {view === 'wizard' && step === 2 && (
@@ -205,7 +217,7 @@ export default function App() {
             setProfiles={setProfiles}
             setMetadata={setMetadata}
             onBack={() => setStep(1)}
-            onNext={() => setStep(3)}
+            onNext={() => goToStep(3)}
           />
         )}
         {view === 'wizard' && step === 3 && (
@@ -236,27 +248,40 @@ export default function App() {
   );
 }
 
-function Stepper({ step, setStep }: { step: number; setStep: (s: number) => void }) {
+function Stepper({
+  step,
+  maxStep,
+  setStep,
+}: {
+  step: number;
+  maxStep: number;
+  setStep: (s: number) => void;
+}) {
   return (
     <div className="border-b bg-muted/30">
       <div className="max-w-6xl mx-auto px-6 py-3 flex gap-2">
-        {STEPS.map((label, i) => (
-          <button
-            key={label}
-            type="button"
-            onClick={() => i < step && setStep(i)}
-            disabled={i > step}
-            className={`text-xs px-3 py-1.5 rounded-full transition-colors ${
-              i === step
-                ? 'bg-primary text-primary-foreground'
-                : i < step
-                  ? 'bg-muted text-foreground hover:bg-muted/70'
-                  : 'bg-muted text-muted-foreground'
-            }`}
-          >
-            {i + 1}. {label}
-          </button>
-        ))}
+        {STEPS.map((label, i) => {
+          // Any step up to the furthest reached is navigable — going back never
+          // discards progress, so forward steps stay clickable.
+          const reachable = i <= maxStep;
+          return (
+            <button
+              key={label}
+              type="button"
+              onClick={() => reachable && i !== step && setStep(i)}
+              disabled={!reachable}
+              className={`text-xs px-3 py-1.5 rounded-full transition-colors ${
+                i === step
+                  ? 'bg-primary text-primary-foreground'
+                  : reachable
+                    ? 'bg-muted text-foreground hover:bg-muted/70'
+                    : 'bg-muted text-muted-foreground'
+              }`}
+            >
+              {i + 1}. {label}
+            </button>
+          );
+        })}
       </div>
     </div>
   );

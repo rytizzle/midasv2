@@ -208,11 +208,27 @@ export function registerSessionRoutes(appkit: AppKit) {
         }
         // admins / override-group members: no access filter (see everything).
 
+        // change_count should reflect what the caller can actually see. Admins,
+        // override-group members, and the submitter of a session count all of
+        // its changes; a group approver counts only the changes their groups
+        // own (matching the filtered detail view). Build the COUNT's predicate
+        // to mirror that.
+        let countPredicate = 'cp.session_id = s.session_id';
+        if (!admin && !canApproveAny) {
+          params.push(me);
+          const meParam = `$${params.length}`;
+          params.push(groups);
+          const groupsParam = `$${params.length}`;
+          countPredicate +=
+            ` AND (s.submitted_by = ${meParam}` +
+            ` OR lower(cp.owner_group) = ANY(${groupsParam}))`;
+        }
+
         const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
         const list = await query<SessionRow & { change_count: string }>(
           `SELECT s.*,
-                  (SELECT COUNT(*) FROM midas.change_proposals
-                   WHERE session_id = s.session_id) AS change_count
+                  (SELECT COUNT(*) FROM midas.change_proposals cp
+                   WHERE ${countPredicate}) AS change_count
            FROM midas.sessions s
            ${where}
            ORDER BY s.created_at DESC
@@ -253,7 +269,16 @@ export function registerSessionRoutes(appkit: AppKit) {
       }
     });
 
-    /** Get one session with all its proposed changes. */
+    /**
+     * Get one session with its proposed changes.
+     *
+     * Change visibility mirrors approval authority so an approver only sees the
+     * tables they can actually act on:
+     *   - workspace admins / override-group members see every change;
+     *   - the submitter sees their whole batch (it's their own submission);
+     *   - a group approver sees ONLY the changes owned by a group they belong
+     *     to — other teams' changes in the same batch are hidden.
+     */
     app.get('/api/sessions/:id', async (req: Request, res: Response) => {
       try {
         const id = String(req.params.id);
@@ -266,16 +291,22 @@ export function registerSessionRoutes(appkit: AppKit) {
         const admin = await isWorkspaceAdmin(req);
         const groups = new Set((await callerGroups(req)).map((g) => g.toLowerCase()));
         const override = adminOverrideGroup();
-        const isApprover =
-          admin ||
-          (override != null && groups.has(override)) ||
-          session.changes.some(
-            (c) => c.owner_group && groups.has(c.owner_group.toLowerCase()),
-          );
-        if (!isApprover && session.submitted_by !== me) {
+        const canSeeAll = admin || (override != null && groups.has(override));
+        const isSubmitter = session.submitted_by === me;
+        const ownsSomeChange = session.changes.some(
+          (c) => c.owner_group && groups.has(c.owner_group.toLowerCase()),
+        );
+        if (!canSeeAll && !isSubmitter && !ownsSomeChange) {
           // Don't leak the existence of other people's sessions.
           res.status(404).json({ error: 'not found' });
           return;
+        }
+        // Group approvers (not admin/override, not the submitter) only see the
+        // changes their groups own. The submitter and privileged users see all.
+        if (!canSeeAll && !isSubmitter) {
+          session.changes = session.changes.filter(
+            (c) => c.owner_group != null && groups.has(c.owner_group.toLowerCase()),
+          );
         }
         res.json(session);
       } catch (err) {

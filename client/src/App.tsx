@@ -529,7 +529,7 @@ function BrowseMode({
   const [catalog, setCatalog] = useState<string | undefined>(undefined);
   const [schemas, setSchemas] = useState<string[]>([]);
   const [schema, setSchema] = useState<string>(''); // '' = all schemas
-  const [tagged, setTagged] = useState<'' | 'tagged' | 'untagged'>(''); // '' = any
+  const [tiers, setTiers] = useState<Set<Tier>>(new Set()); // empty = all tiers
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [tables, setTables] = useState<Table[] | null>(null);
@@ -566,10 +566,13 @@ function BrowseMode({
     return () => clearTimeout(t);
   }, [search]);
 
+  // Stable primitive key for the selected tiers (a Set isn't a stable dep).
+  const tiersKey = TIER_ORDER.filter((t) => tiers.has(t)).join(',');
+
   // Reset paging whenever the query shape changes.
   useEffect(() => {
     setOffset(0);
-  }, [catalog, schema, tagged, debouncedSearch]);
+  }, [catalog, schema, tiersKey, debouncedSearch]);
 
   useEffect(() => {
     if (!catalog || !warehouseId) return;
@@ -580,7 +583,7 @@ function BrowseMode({
       .getAllTables(catalog, warehouseId, {
         schema: schema || undefined,
         q: debouncedSearch || undefined,
-        tagged: tagged || undefined,
+        tiers: tiersKey ? tiersKey.split(',') : undefined,
         limit: PAGE,
         offset,
       })
@@ -599,14 +602,14 @@ function BrowseMode({
     return () => {
       cancelled = true;
     };
-  }, [catalog, schema, tagged, debouncedSearch, offset, warehouseId]);
+  }, [catalog, schema, tiersKey, debouncedSearch, offset, warehouseId]);
 
   const from = total === 0 ? 0 : offset + 1;
   const to = offset + (tables?.length ?? 0);
 
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_1fr_2fr] gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_2fr] gap-3">
         <div className="space-y-1">
           <Label className="text-xs">Catalog</Label>
           {catalogs == null ? (
@@ -643,22 +646,6 @@ function BrowseMode({
           </Select>
         </div>
         <div className="space-y-1">
-          <Label className="text-xs">Governed tags</Label>
-          <Select
-            value={tagged || '__any__'}
-            onValueChange={(v) => setTagged(v === '__any__' ? '' : (v as 'tagged' | 'untagged'))}
-          >
-            <SelectTrigger>
-              <SelectValue placeholder="Any" />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="__any__">Any (tagged or not)</SelectItem>
-              <SelectItem value="tagged">Has a tag</SelectItem>
-              <SelectItem value="untagged">No tag</SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-        <div className="space-y-1">
           <Label className="text-xs">Search tables</Label>
           <Input
             placeholder="Filter by table or schema name…"
@@ -666,6 +653,49 @@ function BrowseMode({
             onChange={(e) => setSearch(e.target.value)}
           />
         </div>
+      </div>
+
+      <div className="space-y-1">
+        <div className="flex items-center gap-2">
+          <Label className="text-xs">Data tier</Label>
+          {tiers.size > 0 && (
+            <button
+              type="button"
+              className="text-[11px] text-muted-foreground hover:text-foreground underline"
+              onClick={() => setTiers(new Set())}
+            >
+              Clear
+            </button>
+          )}
+        </div>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+          {TIER_ORDER.map((t) => {
+            const spec = tierSpec(t);
+            const checked = tiers.has(t);
+            return (
+              <label
+                key={t}
+                className="flex items-center gap-1.5 text-sm cursor-pointer select-none"
+              >
+                <Checkbox
+                  checked={checked}
+                  onCheckedChange={() =>
+                    setTiers((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(t)) next.delete(t);
+                      else next.add(t);
+                      return next;
+                    })
+                  }
+                />
+                <span>{spec.label}</span>
+              </label>
+            );
+          })}
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          No tiers selected shows all. Tier 4 / Non-Tiered includes tables with no tier tag.
+        </p>
       </div>
 
       <Separator />

@@ -2,7 +2,7 @@ import type { Application, Request, Response } from 'express';
 import { userInfo, userWorkspaceClient } from '../lib/user-client';
 import { executeSql } from '../lib/sql';
 import { OWNER_TAG_KEY, TIER_TAG_KEY } from '../lib/tags';
-import { normalizeTier, DEFAULT_TIER } from '../../shared/tiers';
+import { normalizeTier, DEFAULT_TIER, TIER_ORDER } from '../../shared/tiers';
 
 interface AppKit {
   server: { extend(fn: (app: Application) => void): void };
@@ -137,9 +137,18 @@ export function registerCatalogRoutes(appkit: AppKit) {
         const warehouseId = String(req.query.warehouse_id ?? '');
         const schema = String(req.query.schema ?? '');
         const q = String(req.query.q ?? '').trim();
-        // Optional tag-presence filter: 'tagged' (has at least one governed
-        // tag) or 'untagged' (has none). Anything else = no filter.
-        const tagged = String(req.query.tagged ?? '').trim().toLowerCase();
+        // Optional tier filter: comma-separated list of tiers ('0'..'4'). A
+        // table's effective tier is its normalized data_tier tag, or DEFAULT_TIER
+        // (4) when untagged/unrecognized — so selecting 4 also matches
+        // "non-tiered" tables. Empty = no filter.
+        const tiers = [
+          ...new Set(
+            String(req.query.tiers ?? '')
+              .split(',')
+              .map((s) => s.trim())
+              .filter((s) => /^[0-4]$/.test(s)),
+          ),
+        ];
         const limit = Math.min(
           Math.max(Number(req.query.limit ?? 200) || 200, 1),
           MAX_TABLE_PAGE,
@@ -160,14 +169,21 @@ export function registerCatalogRoutes(appkit: AppKit) {
               `OR lower(t.table_schema) LIKE ${escLit(like)} ESCAPE '\\\\')`,
           );
         }
-        // Filter on whether the table carries any governed tag at all. Uses a
-        // correlated (NOT) EXISTS against TABLE_TAGS so it stays independent of
-        // the owner/tier LEFT JOIN below.
-        if (tagged === 'tagged' || tagged === 'untagged') {
-          const exists =
-            `EXISTS (SELECT 1 FROM ${catalog}.INFORMATION_SCHEMA.TABLE_TAGS tt ` +
-            `WHERE tt.schema_name = t.table_schema AND tt.table_name = t.table_name)`;
-          conds.push(tagged === 'untagged' ? `NOT ${exists}` : exists);
+        // Filter on the table's effective DAWG-0002 tier. The effective tier is
+        // the normalized data_tier tag value, or '4' when the tag is absent or
+        // unrecognized — mirroring normalizeTier()/DEFAULT_TIER on the read
+        // path, so Tier 4 also captures "non-tiered" tables. Computed via a
+        // correlated subquery so it's independent of the owner/tier LEFT JOIN.
+        if (tiers.length > 0 && tiers.length < TIER_ORDER.length) {
+          const rawTier =
+            `(SELECT MAX(tt.tag_value) FROM ${catalog}.INFORMATION_SCHEMA.TABLE_TAGS tt ` +
+            `WHERE tt.schema_name = t.table_schema AND tt.table_name = t.table_name ` +
+            `AND lower(tt.tag_name) = ${escLit(TIER_TAG_KEY.toLowerCase())})`;
+          const effTier =
+            `CASE WHEN lower(${rawTier}) = 'critical' THEN '0' ` +
+            `WHEN regexp_extract(lower(${rawTier}), '([0-4])', 1) <> '' ` +
+            `THEN regexp_extract(lower(${rawTier}), '([0-4])', 1) ELSE '4' END`;
+          conds.push(`${effTier} IN (${tiers.map(escLit).join(', ')})`);
         }
         const where = conds.join(' AND ');
         const ws = userWorkspaceClient(req);

@@ -1118,6 +1118,10 @@ function ContextStep({
 
         <div className="space-y-2">
           <Label className="text-xs">Metadata structure by tier</Label>
+          <p className="text-[11px] text-muted-foreground">
+            Each table is generated with the metadata structure for its data tier (from its
+            governed <code>data_tier</code> tag; untagged tables use Tier 4 / Non-Tiered).
+          </p>
           <div className="flex flex-wrap gap-1.5">
             {TIER_ORDER.map((t) => {
               const inUse = tiersInUse.has(t);

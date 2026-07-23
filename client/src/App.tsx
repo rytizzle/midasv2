@@ -529,6 +529,7 @@ function BrowseMode({
   const [catalog, setCatalog] = useState<string | undefined>(undefined);
   const [schemas, setSchemas] = useState<string[]>([]);
   const [schema, setSchema] = useState<string>(''); // '' = all schemas
+  const [tagged, setTagged] = useState<'' | 'tagged' | 'untagged'>(''); // '' = any
   const [search, setSearch] = useState('');
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [tables, setTables] = useState<Table[] | null>(null);
@@ -568,7 +569,7 @@ function BrowseMode({
   // Reset paging whenever the query shape changes.
   useEffect(() => {
     setOffset(0);
-  }, [catalog, schema, debouncedSearch]);
+  }, [catalog, schema, tagged, debouncedSearch]);
 
   useEffect(() => {
     if (!catalog || !warehouseId) return;
@@ -579,6 +580,7 @@ function BrowseMode({
       .getAllTables(catalog, warehouseId, {
         schema: schema || undefined,
         q: debouncedSearch || undefined,
+        tagged: tagged || undefined,
         limit: PAGE,
         offset,
       })
@@ -597,14 +599,14 @@ function BrowseMode({
     return () => {
       cancelled = true;
     };
-  }, [catalog, schema, debouncedSearch, offset, warehouseId]);
+  }, [catalog, schema, tagged, debouncedSearch, offset, warehouseId]);
 
   const from = total === 0 ? 0 : offset + 1;
   const to = offset + (tables?.length ?? 0);
 
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_2fr] gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_1fr_2fr] gap-3">
         <div className="space-y-1">
           <Label className="text-xs">Catalog</Label>
           {catalogs == null ? (
@@ -637,6 +639,22 @@ function BrowseMode({
                   {s}
                 </SelectItem>
               ))}
+            </SelectContent>
+          </Select>
+        </div>
+        <div className="space-y-1">
+          <Label className="text-xs">Governed tags</Label>
+          <Select
+            value={tagged || '__any__'}
+            onValueChange={(v) => setTagged(v === '__any__' ? '' : (v as 'tagged' | 'untagged'))}
+          >
+            <SelectTrigger>
+              <SelectValue placeholder="Any" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="__any__">Any (tagged or not)</SelectItem>
+              <SelectItem value="tagged">Has a tag</SelectItem>
+              <SelectItem value="untagged">No tag</SelectItem>
             </SelectContent>
           </Select>
         </div>

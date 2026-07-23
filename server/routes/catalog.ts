@@ -137,6 +137,9 @@ export function registerCatalogRoutes(appkit: AppKit) {
         const warehouseId = String(req.query.warehouse_id ?? '');
         const schema = String(req.query.schema ?? '');
         const q = String(req.query.q ?? '').trim();
+        // Optional tag-presence filter: 'tagged' (has at least one governed
+        // tag) or 'untagged' (has none). Anything else = no filter.
+        const tagged = String(req.query.tagged ?? '').trim().toLowerCase();
         const limit = Math.min(
           Math.max(Number(req.query.limit ?? 200) || 200, 1),
           MAX_TABLE_PAGE,
@@ -156,6 +159,15 @@ export function registerCatalogRoutes(appkit: AppKit) {
             `(lower(t.table_name) LIKE ${escLit(like)} ESCAPE '\\\\' ` +
               `OR lower(t.table_schema) LIKE ${escLit(like)} ESCAPE '\\\\')`,
           );
+        }
+        // Filter on whether the table carries any governed tag at all. Uses a
+        // correlated (NOT) EXISTS against TABLE_TAGS so it stays independent of
+        // the owner/tier LEFT JOIN below.
+        if (tagged === 'tagged' || tagged === 'untagged') {
+          const exists =
+            `EXISTS (SELECT 1 FROM ${catalog}.INFORMATION_SCHEMA.TABLE_TAGS tt ` +
+            `WHERE tt.schema_name = t.table_schema AND tt.table_name = t.table_name)`;
+          conds.push(tagged === 'untagged' ? `NOT ${exists}` : exists);
         }
         const where = conds.join(' AND ');
         const ws = userWorkspaceClient(req);

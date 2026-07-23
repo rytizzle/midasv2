@@ -179,11 +179,18 @@ export const api = {
   getAllTables: (
     catalog: string,
     warehouseId: string,
-    opts: { schema?: string; q?: string; limit?: number; offset?: number } = {},
+    opts: {
+      schema?: string;
+      q?: string;
+      tagged?: 'tagged' | 'untagged';
+      limit?: number;
+      offset?: number;
+    } = {},
   ) => {
     const p = new URLSearchParams({ catalog, warehouse_id: warehouseId });
     if (opts.schema) p.set('schema', opts.schema);
     if (opts.q) p.set('q', opts.q);
+    if (opts.tagged) p.set('tagged', opts.tagged);
     if (opts.limit != null) p.set('limit', String(opts.limit));
     if (opts.offset != null) p.set('offset', String(opts.offset));
     return getJSON<AllTablesPage>(`/api/catalog/all-tables?${p.toString()}`);

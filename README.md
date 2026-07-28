@@ -259,12 +259,61 @@ npm run dev               # tsx watch + Vite, hot reload
 ```bash
 npm run build                     # build client + server
 node scripts/build-deploy.js      # assemble the .deploy/ payload
-databricks bundle deploy -p midas # upload the bundle
+databricks bundle deploy -p midas # upload the bundle (internal dev target)
 databricks bundle run app -p midas# (re)start the app
 ```
 
 The app is defined in [`databricks.yml`](databricks.yml) (app resource,
 Lakebase instance, serving endpoint, and OAuth scopes).
+
+### Deploying to a customer workspace
+
+The bundle ships two targets:
+
+| Target | Host | Use |
+|---|---|---|
+| `default` | `fevm-midas` (hardcoded) | Internal Midas dev workspace |
+| `customer` | from the CLI profile / `DATABRICKS_HOST` | Any customer workspace |
+
+Two things are parameterized for a customer deploy:
+
+- **Workspace host** — comes from the Databricks CLI **profile** (`-p`) or the
+  `DATABRICKS_HOST` env var. It is *not* a bundle variable: the CLI forbids
+  variable interpolation on `workspace.host` because that field configures
+  authentication.
+- **Lakebase instance name** — the `lakebase_instance` bundle variable
+  (default `midasv2-lakebase`), passed with `--var`. It's the single source of
+  truth: it names both the Lakebase instance the bundle **provisions** and the
+  runtime `LAKEBASE_INSTANCE_NAME` the app uses to mint OAuth DB credentials, so
+  the two can never drift.
+
+```bash
+# Build the payload first
+npm run build
+node scripts/build-deploy.js
+
+# Deploy with a customer CLI profile
+databricks bundle deploy -t customer -p <customer-profile> \
+  --var="lakebase_instance=<instance-name>"
+databricks bundle run app -t customer -p <customer-profile>
+```
+
+Or, without a configured profile:
+
+```bash
+export DATABRICKS_HOST=https://<customer>.cloud.databricks.com
+export DATABRICKS_TOKEN=<token>
+databricks bundle deploy -t customer --var="lakebase_instance=<instance-name>"
+```
+
+This provisions a **dedicated** Lakebase instance (`CU_1`) under the given name
+and deploys the app against it. On first boot the app creates the `app_db`
+database, the `midas` schema, and its tables automatically.
+
+> **Prerequisites in the customer workspace:** Lakebase must be enabled, and the
+> serving endpoint named in [`databricks.yml`](databricks.yml)
+> (`databricks-gpt-5-4` by default) must exist — change that name if the
+> workspace uses a different LLM endpoint.
 
 ### Useful scripts
 

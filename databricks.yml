@@ -1,6 +1,14 @@
 bundle:
   name: midasv2
 
+variables:
+  lakebase_instance:
+    description: >-
+      Name of the Lakebase (managed Postgres) instance this app provisions and
+      uses for the approval-workflow store. One source of truth: it names both
+      the provisioned resource and the runtime LAKEBASE_INSTANCE_NAME env var.
+    default: midasv2-lakebase
+
 sync:
   include:
     - .deploy/**
@@ -8,7 +16,7 @@ sync:
 resources:
   database_instances:
     lakebase:
-      name: midasv2-lakebase
+      name: ${var.lakebase_instance}
       capacity: CU_1
 
   apps:
@@ -16,6 +24,13 @@ resources:
       name: "midasv2"
       description: "Midas v2 - AI Metadata Generator for Unity Catalog (AppKit rebuild)"
       source_code_path: ./.deploy
+
+      config:
+        env:
+          # Runtime must target the same instance the bundle provisions, so
+          # OAuth DB credential generation hits the right Lakebase instance.
+          - name: LAKEBASE_INSTANCE_NAME
+            value: ${var.lakebase_instance}
 
       user_api_scopes:
         - sql
@@ -38,7 +53,23 @@ resources:
             permission: CAN_CONNECT_AND_CREATE
 
 targets:
+  # Internal Midas dev workspace (unchanged default).
   default:
     default: true
     workspace:
       host: https://fevm-midas.cloud.databricks.com
+
+  # Customer deploy. The workspace host is NOT set here: the Databricks CLI
+  # forbids variable interpolation on workspace.host (it configures auth), so
+  # the host comes from the CLI profile (-p) or the DATABRICKS_HOST env var.
+  # The Lakebase instance name is entered at deploy time via --var.
+  #
+  #   databricks bundle deploy -t customer -p <customer-profile> \
+  #     --var="lakebase_instance=<instance-name>"
+  #
+  # or, without a profile:
+  #   export DATABRICKS_HOST=https://<customer>.cloud.databricks.com
+  #   export DATABRICKS_TOKEN=<token>
+  #   databricks bundle deploy -t customer --var="lakebase_instance=<instance-name>"
+  customer:
+    mode: production

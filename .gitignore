@@ -1,9 +1,10 @@
 .DS_Store
 node_modules/
-client/dist/
-dist/
-build/
-.deploy/
+# Anchored to repo root so these do NOT match the committed .deploy/ payload
+# (.deploy/dist, .deploy/client/dist) — Option 1 ships prebuilt artifacts.
+/client/dist/
+/dist/
+/build/
 .env
 .databricks/
 .smoke-test/
